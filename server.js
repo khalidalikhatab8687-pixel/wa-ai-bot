@@ -30,6 +30,8 @@ app.use(express.json({ limit: '10mb' }));
 
 const logger = pino({ level: 'silent' });
 const DASHBOARD_PASSWORD = 'iamITM@nager';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+let authGistId = process.env.AUTH_GIST_ID || '';
 
 // Groq client for voice transcription
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -39,6 +41,51 @@ const KNOWLEDGE_DIR = path.join(__dirname, 'knowledge');
 const CUSTOMERS_DIR = path.join(__dirname, 'customers');
 const TEMP_DIR = path.join(__dirname, 'temp');
 [KNOWLEDGE_DIR, CUSTOMERS_DIR, TEMP_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
+
+// --- Auth Backup/Restore via GitHub Gist ---
+async function backupAuthToGitHub() {
+  if (!GITHUB_TOKEN) return;
+  const authDir = path.join(__dirname, 'auth_info');
+  if (!fs.existsSync(authDir)) return;
+  try {
+    const files = {};
+    const entries = fs.readdirSync(authDir);
+    for (const f of entries) {
+      const fp = path.join(authDir, f);
+      if (fs.statSync(fp).isFile()) {
+        files[f] = { content: fs.readFileSync(fp, 'utf8') };
+      }
+    }
+    if (Object.keys(files).length === 0) return;
+
+    const headers = { Authorization: `token ${GITHUB_TOKEN}`, 'Content-Type': 'application/json' };
+    if (authGistId) {
+      await fetch(`https://api.github.com/gists/${authGistId}`, { method: 'PATCH', headers, body: JSON.stringify({ files }) });
+      console.log('☁️ Auth backed up to GitHub (updated)');
+    } else {
+      const res = await fetch('https://api.github.com/gists', { method: 'POST', headers, body: JSON.stringify({ description: 'WA Bot Auth Backup', public: false, files }) });
+      const data = await res.json();
+      if (data.id) { authGistId = data.id; console.log(`☁️ Auth backed up to GitHub. GIST ID: ${authGistId}`); console.log(`⚠️ Add AUTH_GIST_ID=${authGistId} to your environment variables!`); }
+    }
+  } catch (err) { console.error('Auth backup error:', err.message); }
+}
+
+async function restoreAuthFromGitHub() {
+  if (!GITHUB_TOKEN || !authGistId) return false;
+  const authDir = path.join(__dirname, 'auth_info');
+  if (fs.existsSync(authDir) && fs.readdirSync(authDir).length > 0) return true; // already exists
+  try {
+    const res = await fetch(`https://api.github.com/gists/${authGistId}`, { headers: { Authorization: `token ${GITHUB_TOKEN}` } });
+    const data = await res.json();
+    if (!data.files) return false;
+    if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
+    for (const [name, file] of Object.entries(data.files)) {
+      fs.writeFileSync(path.join(authDir, name), file.content, 'utf8');
+    }
+    console.log('☁️ Auth restored from GitHub! No QR needed.');
+    return true;
+  } catch (err) { console.error('Auth restore error:', err.message); return false; }
+}
 
 // --- State ---
 let whatsappSocket = null;
@@ -428,6 +475,8 @@ async function startWhatsApp() {
 
   try {
     const authDir = path.join(__dirname, 'auth_info');
+    // Try to restore auth from GitHub backup
+    await restoreAuthFromGitHub();
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
     let version;
@@ -491,10 +540,16 @@ async function startWhatsApp() {
         connectionStatus = 'connected';
         currentQR = null;
         io.emit('status_change', { status: 'connected' });
+        // Backup auth after successful connection
+        setTimeout(() => backupAuthToGitHub(), 3000);
       }
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+      await saveCreds();
+      // Backup after creds update too
+      backupAuthToGitHub();
+    });
 
     // --- Message Handler ---
     sock.ev.on('messages.upsert', async (m) => {
