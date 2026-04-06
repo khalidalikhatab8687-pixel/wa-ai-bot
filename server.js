@@ -9,136 +9,299 @@ import fetch from 'node-fetch';
 import QRCode from 'qrcode';
 import pino from 'pino';
 import fs from 'fs';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import Groq from 'groq-sdk';
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  makeCacheableSignalKeyStore,
+  fetchLatestBaileysVersion,
+  downloadMediaMessage
+} from '@whiskeysockets/baileys';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
-});
+const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const logger = pino({ level: 'silent' });
+const DASHBOARD_PASSWORD = 'iamITM@nager';
+
+// Groq client for voice transcription
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+// --- Directories ---
+const KNOWLEDGE_DIR = path.join(__dirname, 'knowledge');
+const CUSTOMERS_DIR = path.join(__dirname, 'customers');
+const TEMP_DIR = path.join(__dirname, 'temp');
+[KNOWLEDGE_DIR, CUSTOMERS_DIR, TEMP_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 
 // --- State ---
 let whatsappSocket = null;
 let connectionStatus = 'disconnected';
 let currentQR = null;
 let messageLogs = [];
-const MAX_LOGS = 200;
+const MAX_LOGS = 500;
 let botEnabled = true;
-let botPrompt = process.env.BOT_PROMPT || 'You are a helpful AI assistant.';
-let botName = process.env.BOT_NAME || 'WA AI Assistant';
-let ignoredNumbers = [];
-let onlyRespondTo = [];
-let conversationHistory = new Map();
-const MAX_HISTORY = 10;
+let voiceTranscriptionEnabled = true;
 
-// --- Health Check (for UptimeRobot) ---
+// --- Knowledge Base Helpers ---
+function loadKnowledge(file) {
+  const p = path.join(KNOWLEDGE_DIR, `${file}.json`);
+  if (!fs.existsSync(p)) return {};
+  return JSON.parse(fs.readFileSync(p, 'utf8'));
+}
+
+function saveKnowledge(file, data) {
+  const p = path.join(KNOWLEDGE_DIR, `${file}.json`);
+  fs.writeFileSync(p, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function buildSystemPrompt() {
+  const persona = loadKnowledge('persona');
+  const instructions = loadKnowledge('instructions');
+  const pricing = loadKnowledge('pricing');
+  const routes = loadKnowledge('routes');
+
+  let prompt = `# Your Identity\n`;
+  prompt += `Name: ${persona.name || 'AI Assistant'}\n`;
+  prompt += `Personality: ${persona.personality || 'Friendly and professional'}\n`;
+  prompt += `Tone: ${persona.tone || 'Professional'}\n`;
+  prompt += `Language: ${persona.language || 'Arabic'}\n\n`;
+
+  if (persona.rules?.length) {
+    prompt += `# Rules\n${persona.rules.map(r => `- ${r}`).join('\n')}\n\n`;
+  }
+  if (persona.doNotDiscuss?.length) {
+    prompt += `# Do NOT discuss\n${persona.doNotDiscuss.map(r => `- ${r}`).join('\n')}\n\n`;
+  }
+  if (persona.customInstructions) {
+    prompt += `# Custom Instructions\n${persona.customInstructions}\n\n`;
+  }
+
+  prompt += `# Company Information\n`;
+  prompt += `Company: ${instructions.companyName || 'N/A'}\n`;
+  prompt += `Description: ${instructions.description || ''}\n`;
+  prompt += `Working Hours: ${instructions.workingHours || ''}\n`;
+  prompt += `Address: ${instructions.address || ''}\n`;
+  prompt += `Email: ${instructions.email || ''}\n`;
+  prompt += `Website: ${instructions.website || ''}\n`;
+  prompt += `About: ${instructions.about || ''}\n\n`;
+
+  if (instructions.faq?.length) {
+    prompt += `# FAQ\n`;
+    instructions.faq.forEach(f => { prompt += `Q: ${f.question}\nA: ${f.answer}\n\n`; });
+  }
+
+  if (pricing.categories?.length) {
+    prompt += `# Products & Services\n`;
+    pricing.categories.forEach(cat => {
+      prompt += `## ${cat.name}\n`;
+      cat.items?.forEach(item => {
+        prompt += `- ${item.name}: ${item.price} - ${item.description || ''} ${item.details || ''} ${item.available ? '(Available)' : '(Unavailable)'}\n`;
+      });
+      prompt += '\n';
+    });
+  }
+
+  if (pricing.offers?.length) {
+    prompt += `# Current Offers\n`;
+    pricing.offers.filter(o => o.active).forEach(o => {
+      prompt += `- ${o.name}: ${o.description} (Discount: ${o.discount}, Valid until: ${o.validUntil})\n`;
+    });
+    prompt += '\n';
+  }
+
+  if (routes.departments?.length) {
+    prompt += `# Transfer/Routing\n`;
+    prompt += `When a customer wants to talk to a human or requests transfer, identify the department and respond with EXACTLY this format on a new line:\n`;
+    prompt += `[TRANSFER:department_name]\n`;
+    prompt += `Available departments:\n`;
+    routes.departments.forEach(d => {
+      prompt += `- ${d.name}: ${d.description} (keywords: ${d.keywords.join(', ')})\n`;
+    });
+    prompt += `\nTransfer keywords: ${routes.transferKeywords?.join(', ') || ''}\n`;
+    prompt += `When you detect a transfer request, include [TRANSFER:department_name] at the END of your response.\n`;
+  }
+
+  prompt += `\n# Greeting\nUse this greeting for new customers: "${persona.greeting || 'Welcome!'}"\n`;
+  prompt += `# Farewell\nUse this farewell: "${persona.farewell || 'Thank you!'}"\n`;
+
+  return prompt;
+}
+
+// --- Customer History ---
+function getCustomerPath(phone) {
+  return path.join(CUSTOMERS_DIR, `${phone}.json`);
+}
+
+function loadCustomer(phone) {
+  const p = getCustomerPath(phone);
+  if (!fs.existsSync(p)) {
+    return { phone, firstContact: new Date().toISOString(), messages: [] };
+  }
+  return JSON.parse(fs.readFileSync(p, 'utf8'));
+}
+
+function saveCustomer(phone, data) {
+  fs.writeFileSync(getCustomerPath(phone), JSON.stringify(data, null, 2), 'utf8');
+}
+
+function addCustomerMessage(phone, role, content) {
+  const customer = loadCustomer(phone);
+  customer.messages.push({ role, content, timestamp: new Date().toISOString() });
+  customer.lastContact = new Date().toISOString();
+  saveCustomer(phone, customer);
+  return customer;
+}
+
+function getCustomerContext(phone, count = 5) {
+  const customer = loadCustomer(phone);
+  const recent = customer.messages.slice(-count * 2); // last N exchanges
+  return recent.map(m => ({ role: m.role, content: m.content }));
+}
+
+function listCustomers() {
+  if (!fs.existsSync(CUSTOMERS_DIR)) return [];
+  return fs.readdirSync(CUSTOMERS_DIR)
+    .filter(f => f.endsWith('.json'))
+    .map(f => {
+      const data = JSON.parse(fs.readFileSync(path.join(CUSTOMERS_DIR, f), 'utf8'));
+      return {
+        phone: data.phone,
+        firstContact: data.firstContact,
+        lastContact: data.lastContact,
+        messageCount: data.messages?.length || 0
+      };
+    })
+    .sort((a, b) => new Date(b.lastContact || 0) - new Date(a.lastContact || 0));
+}
+
+// --- Health Check & Self-Ping ---
 app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    whatsapp: connectionStatus,
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString()
-  });
+  res.status(200).json({ status: 'ok', whatsapp: connectionStatus, uptime: process.uptime(), timestamp: new Date().toISOString() });
 });
 
+// Self-ping to prevent Render from sleeping
+setInterval(() => {
+  const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`;
+  fetch(`${url}/health`).catch(() => {});
+}, 4 * 60 * 1000); // every 4 minutes
+
+// --- Dashboard Auth ---
+app.post('/api/auth', (req, res) => {
+  const { password } = req.body;
+  if (password === DASHBOARD_PASSWORD) {
+    res.json({ success: true, token: Buffer.from(`${DASHBOARD_PASSWORD}:${Date.now()}`).toString('base64') });
+  } else {
+    res.status(401).json({ error: 'Invalid password' });
+  }
+});
+
+function authMiddleware(req, res, next) {
+  const token = req.headers['x-auth-token'];
+  if (!token) return res.status(401).json({ error: 'No auth token' });
+  try {
+    const decoded = Buffer.from(token, 'base64').toString('utf8');
+    if (decoded.startsWith(DASHBOARD_PASSWORD + ':')) return next();
+    return res.status(401).json({ error: 'Invalid token' });
+  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+}
+
 // --- API Routes ---
-app.get('/api/status', (req, res) => {
-  res.json({
-    connectionStatus,
-    botEnabled,
-    botName,
-    botPrompt,
-    totalMessages: messageLogs.length,
-    ignoredNumbers,
-    onlyRespondTo
-  });
+app.get('/api/status', authMiddleware, (req, res) => {
+  res.json({ connectionStatus, botEnabled, voiceTranscriptionEnabled, totalMessages: messageLogs.length });
 });
 
 app.get('/api/qr', (req, res) => {
   res.json({ qr: currentQR, status: connectionStatus });
 });
 
-app.get('/api/logs', (req, res) => {
+app.get('/api/logs', authMiddleware, (req, res) => {
   const limit = parseInt(req.query.limit) || 50;
   const offset = parseInt(req.query.offset) || 0;
-  res.json({
-    logs: messageLogs.slice(offset, offset + limit),
-    total: messageLogs.length
-  });
+  res.json({ logs: messageLogs.slice(offset, offset + limit), total: messageLogs.length });
 });
 
-app.post('/api/settings', (req, res) => {
-  const { botEnabled: enabled, botPrompt: prompt, botName: name, ignoredNumbers: ignored, onlyRespondTo: only } = req.body;
-  if (enabled !== undefined) botEnabled = enabled;
-  if (prompt) botPrompt = prompt;
-  if (name) botName = name;
-  if (ignored) ignoredNumbers = ignored;
-  if (only) onlyRespondTo = only;
-  io.emit('settings_update', { botEnabled, botPrompt, botName, ignoredNumbers, onlyRespondTo });
-  res.json({ success: true });
-});
-
-app.post('/api/send', async (req, res) => {
-  const { number, message } = req.body;
-  if (!whatsappSocket || connectionStatus !== 'connected') {
-    return res.status(400).json({ error: 'WhatsApp not connected' });
-  }
-  try {
-    const jid = number.includes('@') ? number : `${number}@s.whatsapp.net`;
-    await whatsappSocket.sendMessage(jid, { text: message });
-    addLog('outgoing_manual', number, message, null);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/disconnect', async (req, res) => {
-  try {
-    if (whatsappSocket) {
-      await whatsappSocket.logout();
-      whatsappSocket = null;
-    }
-    connectionStatus = 'disconnected';
-    currentQR = null;
-    io.emit('status_change', { status: connectionStatus });
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/restart', async (req, res) => {
-  try {
-    if (whatsappSocket) {
-      try { whatsappSocket.end(); } catch(e) {}
-      whatsappSocket = null;
-    }
-    connectionStatus = 'disconnected';
-    currentQR = null;
-    io.emit('status_change', { status: connectionStatus });
-    startWhatsApp();
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/clear-logs', (req, res) => {
+app.post('/api/clear-logs', authMiddleware, (req, res) => {
   messageLogs = [];
   io.emit('logs_cleared');
   res.json({ success: true });
 });
 
-// --- Serve React build in production ---
+app.post('/api/settings', authMiddleware, (req, res) => {
+  const { botEnabled: en, voiceTranscriptionEnabled: vt } = req.body;
+  if (en !== undefined) botEnabled = en;
+  if (vt !== undefined) voiceTranscriptionEnabled = vt;
+  io.emit('settings_update', { botEnabled, voiceTranscriptionEnabled });
+  res.json({ success: true });
+});
+
+// --- Knowledge Base API ---
+app.get('/api/knowledge/:file', authMiddleware, (req, res) => {
+  const allowed = ['instructions', 'pricing', 'persona', 'routes'];
+  if (!allowed.includes(req.params.file)) return res.status(400).json({ error: 'Invalid file' });
+  res.json(loadKnowledge(req.params.file));
+});
+
+app.put('/api/knowledge/:file', authMiddleware, (req, res) => {
+  const allowed = ['instructions', 'pricing', 'persona', 'routes'];
+  if (!allowed.includes(req.params.file)) return res.status(400).json({ error: 'Invalid file' });
+  saveKnowledge(req.params.file, req.body);
+  res.json({ success: true });
+});
+
+// --- Customers API ---
+app.get('/api/customers', authMiddleware, (req, res) => {
+  res.json(listCustomers());
+});
+
+app.get('/api/customers/:phone', authMiddleware, (req, res) => {
+  res.json(loadCustomer(req.params.phone));
+});
+
+app.delete('/api/customers/:phone', authMiddleware, (req, res) => {
+  const p = getCustomerPath(req.params.phone);
+  if (fs.existsSync(p)) fs.unlinkSync(p);
+  res.json({ success: true });
+});
+
+// --- Send Message ---
+app.post('/api/send', authMiddleware, async (req, res) => {
+  const { number, message } = req.body;
+  if (!whatsappSocket || connectionStatus !== 'connected') return res.status(400).json({ error: 'WhatsApp not connected' });
+  try {
+    const jid = number.includes('@') ? number : `${number}@s.whatsapp.net`;
+    await whatsappSocket.sendMessage(jid, { text: message });
+    addLog('outgoing_manual', number, message, null);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/disconnect', authMiddleware, async (req, res) => {
+  try {
+    if (whatsappSocket) { await whatsappSocket.logout(); whatsappSocket = null; }
+    connectionStatus = 'disconnected'; currentQR = null;
+    io.emit('status_change', { status: connectionStatus });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/restart', authMiddleware, async (req, res) => {
+  try {
+    if (whatsappSocket) { try { whatsappSocket.end(); } catch(e) {} whatsappSocket = null; }
+    connectionStatus = 'disconnected'; currentQR = null;
+    io.emit('status_change', { status: connectionStatus });
+    startWhatsApp();
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// --- Serve React ---
 const clientBuildPath = path.join(__dirname, 'client', 'dist');
 app.use(express.static(clientBuildPath));
 app.get('*', (req, res) => {
@@ -149,41 +312,41 @@ app.get('*', (req, res) => {
 
 // --- Helpers ---
 function addLog(type, from, body, aiResponse) {
-  const log = {
-    id: Date.now() + Math.random(),
-    type,
-    from,
-    body,
-    aiResponse,
-    timestamp: new Date().toISOString()
-  };
+  const log = { id: Date.now() + Math.random(), type, from, body, aiResponse, timestamp: new Date().toISOString() };
   messageLogs.unshift(log);
   if (messageLogs.length > MAX_LOGS) messageLogs.pop();
   io.emit('new_message', log);
 }
 
-function getConversationHistory(phone) {
-  if (!conversationHistory.has(phone)) {
-    conversationHistory.set(phone, []);
-  }
-  return conversationHistory.get(phone);
-}
-
-function addToConversation(phone, role, content) {
-  const history = getConversationHistory(phone);
-  history.push({ role, content });
-  if (history.length > MAX_HISTORY) {
-    history.splice(0, history.length - MAX_HISTORY);
+// --- Voice Transcription ---
+async function transcribeVoice(buffer) {
+  try {
+    const tempFile = path.join(TEMP_DIR, `voice_${Date.now()}.ogg`);
+    fs.writeFileSync(tempFile, buffer);
+    const transcription = await groq.audio.transcriptions.create({
+      file: fs.createReadStream(tempFile),
+      model: 'whisper-large-v3-turbo',
+      temperature: 0,
+      language: 'ar',
+      response_format: 'verbose_json'
+    });
+    // Cleanup
+    try { fs.unlinkSync(tempFile); } catch {}
+    return transcription.text || '';
+  } catch (err) {
+    console.error('Transcription error:', err.message);
+    return null;
   }
 }
 
 // --- OpenRouter AI ---
 async function getAIResponse(userMessage, phone) {
   try {
-    const history = getConversationHistory(phone);
+    const systemPrompt = buildSystemPrompt();
+    const context = getCustomerContext(phone, 5);
     const messages = [
-      { role: 'system', content: botPrompt },
-      ...history,
+      { role: 'system', content: systemPrompt },
+      ...context,
       { role: 'user', content: userMessage }
     ];
 
@@ -192,37 +355,70 @@ async function getAIResponse(userMessage, phone) {
       headers: {
         'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
         'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://wa-ai-bot.onrender.com',
+        'HTTP-Referer': process.env.RENDER_EXTERNAL_URL || 'https://wa-ai-bot.onrender.com',
         'X-Title': 'WA AI Bot'
       },
       body: JSON.stringify({
         model: process.env.OPENROUTER_MODEL || 'openai/gpt-oss-120b:free',
         messages,
-        max_tokens: 500,
+        max_tokens: 700,
         temperature: 0.7
       })
     });
 
     const data = await response.json();
+    if (data.error) { console.error('OpenRouter Error:', data.error); return `⚠️ AI Error: ${data.error.message || 'Unknown'}`; }
+    const aiReply = data.choices?.[0]?.message?.content || 'عذراً، لم أستطع إنشاء رد.';
 
-    if (data.error) {
-      console.error('OpenRouter Error:', data.error);
-      return `⚠️ AI Error: ${data.error.message || 'Unknown error'}`;
-    }
-
-    const aiReply = data.choices?.[0]?.message?.content || 'Sorry, I could not generate a response.';
-
-    addToConversation(phone, 'user', userMessage);
-    addToConversation(phone, 'assistant', aiReply);
+    // Save to customer history
+    addCustomerMessage(phone, 'user', userMessage);
+    addCustomerMessage(phone, 'assistant', aiReply);
 
     return aiReply;
   } catch (err) {
     console.error('AI Request Error:', err.message);
-    return '⚠️ Sorry, AI service is temporarily unavailable.';
+    return '⚠️ عذراً، خدمة الذكاء الاصطناعي غير متاحة حالياً.';
   }
 }
 
-// --- WhatsApp with Baileys ---
+// --- Route Forwarding ---
+async function handleTransfer(aiResponse, customerPhone, sock) {
+  const transferMatch = aiResponse.match(/\[TRANSFER:(.+?)\]/);
+  if (!transferMatch) return aiResponse;
+
+  const deptName = transferMatch[1].trim();
+  const routes = loadKnowledge('routes');
+  const dept = routes.departments?.find(d => d.name === deptName || d.name.includes(deptName));
+
+  if (!dept) return aiResponse.replace(/\[TRANSFER:.+?\]/, '');
+
+  // Get last 5 messages
+  const customer = loadCustomer(customerPhone);
+  const lastMessages = customer.messages.slice(-10).map(m => `${m.role === 'user' ? '👤 العميل' : '🤖 البوت'}: ${m.content}`).join('\n');
+
+  // Build transfer message to responsible person
+  const transferMsg = `📋 *طلب تحويل جديد*\n\n` +
+    `👤 *رقم العميل:* ${customerPhone}\n` +
+    `🏢 *القسم:* ${dept.name}\n` +
+    `📅 *الوقت:* ${new Date().toLocaleString('ar-EG')}\n\n` +
+    `💬 *آخر المحادثات:*\n${lastMessages}`;
+
+  // Send to responsible person
+  try {
+    const responsibleJid = `${dept.phone}@s.whatsapp.net`;
+    await sock.sendMessage(responsibleJid, { text: transferMsg });
+    console.log(`📲 Transfer sent to ${dept.name} (${dept.phone})`);
+  } catch (err) {
+    console.error('Transfer error:', err.message);
+  }
+
+  // Return clean response + transfer confirmation
+  const cleanResponse = aiResponse.replace(/\[TRANSFER:.+?\]/, '').trim();
+  const transferConfirm = routes.transferMessage || '✅ تم إرسال طلبك للشخص المسؤول وسيتم التواصل معكم في أسرع وقت.';
+  return cleanResponse ? `${cleanResponse}\n\n${transferConfirm}` : transferConfirm;
+}
+
+// --- WhatsApp ---
 async function startWhatsApp() {
   console.log('🚀 Starting WhatsApp connection...');
   connectionStatus = 'connecting';
@@ -232,23 +428,16 @@ async function startWhatsApp() {
     const authDir = path.join(__dirname, 'auth_info');
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-    // Fetch latest WhatsApp Web version to avoid 405 errors
     let version;
     try {
-      const versionInfo = await fetchLatestBaileysVersion();
-      version = versionInfo.version;
+      const v = await fetchLatestBaileysVersion();
+      version = v.version;
       console.log(`📋 Using WA version: ${version}`);
-    } catch (e) {
-      console.log('⚠️ Could not fetch version, using default');
-      version = [2, 3000, 1015901307];
-    }
+    } catch { version = [2, 3000, 1015901307]; }
 
     const createSocket = makeWASocket.default || makeWASocket;
     const sock = createSocket({
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger)
-      },
+      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
       version,
       printQRInTerminal: false,
       logger,
@@ -260,47 +449,33 @@ async function startWhatsApp() {
 
     whatsappSocket = sock;
 
-    // Connection update handler
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
         console.log('📱 QR Code generated');
         try {
-          const qrDataUrl = await QRCode.toDataURL(qr, {
-            width: 300,
-            margin: 2,
-            color: { dark: '#000000', light: '#ffffff' }
-          });
+          const qrDataUrl = await QRCode.toDataURL(qr, { width: 300, margin: 2, color: { dark: '#000000', light: '#ffffff' } });
           currentQR = qrDataUrl;
           connectionStatus = 'qr';
           io.emit('qr_code', { qr: qrDataUrl });
           io.emit('status_change', { status: 'qr' });
-        } catch (err) {
-          console.error('QR generation error:', err);
-        }
+        } catch (err) { console.error('QR error:', err); }
       }
 
       if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        console.log(`❌ Connection closed. Status: ${statusCode}`);
-
-        currentQR = null;
-        whatsappSocket = null;
-
-        if (statusCode === DisconnectReason.loggedOut) {
+        const sc = lastDisconnect?.error?.output?.statusCode;
+        console.log(`❌ Connection closed. Status: ${sc}`);
+        currentQR = null; whatsappSocket = null;
+        if (sc === DisconnectReason.loggedOut) {
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
-          console.log('📵 Logged out. Need to scan QR again.');
-          const authPath = path.join(__dirname, 'auth_info');
-          if (fs.existsSync(authPath)) {
-            fs.rmSync(authPath, { recursive: true, force: true });
-          }
+          const ap = path.join(__dirname, 'auth_info');
+          if (fs.existsSync(ap)) fs.rmSync(ap, { recursive: true, force: true });
           setTimeout(startWhatsApp, 5000);
         } else {
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
-          console.log('🔄 Reconnecting in 5 seconds...');
           setTimeout(startWhatsApp, 5000);
         }
       }
@@ -313,10 +488,9 @@ async function startWhatsApp() {
       }
     });
 
-    // Save credentials on update
     sock.ev.on('creds.update', saveCreds);
 
-    // Message handler
+    // --- Message Handler ---
     sock.ev.on('messages.upsert', async (m) => {
       if (m.type !== 'notify') return;
 
@@ -326,37 +500,51 @@ async function startWhatsApp() {
         if (msg.key.remoteJid?.endsWith('@g.us')) continue;
         if (msg.key.fromMe) continue;
 
-        const text = msg.message.conversation
-          || msg.message.extendedTextMessage?.text
-          || msg.message.imageMessage?.caption
-          || msg.message.videoMessage?.caption
-          || '';
+        const phone = msg.key.remoteJid?.replace('@s.whatsapp.net', '') || 'unknown';
+        let text = '';
+
+        // Handle voice messages
+        const audioMsg = msg.message.audioMessage;
+        if (audioMsg && voiceTranscriptionEnabled) {
+          console.log(`🎤 Voice message from ${phone}`);
+          try {
+            const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+            const transcription = await transcribeVoice(buffer);
+            if (transcription) {
+              text = transcription;
+              console.log(`📝 Transcribed: ${text.substring(0, 80)}...`);
+              addLog('voice_transcribed', phone, `🎤 Voice → "${text}"`, null);
+            } else {
+              await sock.sendMessage(msg.key.remoteJid, { text: '⚠️ عذراً، لم أستطع فهم الرسالة الصوتية. يرجى إرسالها كتابةً.' });
+              addLog('voice_error', phone, '🎤 Failed to transcribe', null);
+              continue;
+            }
+          } catch (err) {
+            console.error('Voice download error:', err.message);
+            continue;
+          }
+        } else {
+          // Text messages
+          text = msg.message.conversation
+            || msg.message.extendedTextMessage?.text
+            || msg.message.imageMessage?.caption
+            || msg.message.videoMessage?.caption
+            || '';
+        }
 
         if (!text || text.trim() === '') continue;
-
-        const phone = msg.key.remoteJid?.replace('@s.whatsapp.net', '') || 'unknown';
         console.log(`📩 Message from ${phone}: ${text}`);
 
-        if (ignoredNumbers.includes(phone)) {
-          addLog('ignored', phone, text, null);
-          continue;
-        }
-
-        if (onlyRespondTo.length > 0 && !onlyRespondTo.includes(phone)) {
-          addLog('filtered', phone, text, null);
-          continue;
-        }
-
-        if (!botEnabled) {
-          addLog('disabled', phone, text, null);
-          continue;
-        }
+        if (!botEnabled) { addLog('disabled', phone, text, null); continue; }
 
         try {
           await sock.presenceSubscribe(msg.key.remoteJid);
           await sock.sendPresenceUpdate('composing', msg.key.remoteJid);
 
-          const aiResponse = await getAIResponse(text, phone);
+          let aiResponse = await getAIResponse(text, phone);
+
+          // Handle transfer routing
+          aiResponse = await handleTransfer(aiResponse, phone, sock);
 
           await sock.sendPresenceUpdate('paused', msg.key.remoteJid);
           await sock.sendMessage(msg.key.remoteJid, { text: aiResponse });
@@ -371,10 +559,9 @@ async function startWhatsApp() {
     });
 
   } catch (err) {
-    console.error('❌ WhatsApp connection error:', err.message);
+    console.error('❌ WhatsApp error:', err.message);
     connectionStatus = 'disconnected';
     io.emit('status_change', { status: 'disconnected' });
-    console.log('🔄 Retrying in 10 seconds...');
     setTimeout(startWhatsApp, 10000);
   }
 }
@@ -383,18 +570,17 @@ async function startWhatsApp() {
 io.on('connection', (socket) => {
   console.log('🔌 Dashboard connected');
   socket.emit('status_change', { status: connectionStatus });
-  if (currentQR) {
-    socket.emit('qr_code', { qr: currentQR });
-  }
-  socket.emit('settings_update', { botEnabled, botPrompt, botName, ignoredNumbers, onlyRespondTo });
+  if (currentQR) socket.emit('qr_code', { qr: currentQR });
+  socket.emit('settings_update', { botEnabled, voiceTranscriptionEnabled });
 });
 
-// --- Start Server ---
+// --- Start ---
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🌐 Server running on http://localhost:${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
   console.log(`🤖 AI Model: ${process.env.OPENROUTER_MODEL}`);
+  console.log(`🎤 Voice Transcription: ${process.env.GROQ_API_KEY ? 'Enabled' : 'Disabled'}`);
   console.log('');
   startWhatsApp();
 });

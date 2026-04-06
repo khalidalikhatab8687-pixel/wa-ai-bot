@@ -1,438 +1,439 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { io } from 'socket.io-client';
+import './index.css';
 
-const SOCKET_URL = window.location.hostname === 'localhost'
-  ? 'http://localhost:3000'
-  : window.location.origin;
+const API = window.location.hostname === 'localhost' ? 'http://localhost:3000' : '';
 
+function api(path, opts = {}) {
+  const token = localStorage.getItem('wa_token');
+  return fetch(`${API}${path}`, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', 'x-auth-token': token || '', ...opts.headers }
+  }).then(r => { if (r.status === 401) { localStorage.removeItem('wa_token'); window.location.reload(); } return r.json(); });
+}
+
+// ========== LOGIN ==========
+function LoginPage({ onLogin }) {
+  const [pw, setPw] = useState('');
+  const [err, setErr] = useState('');
+  const submit = async (e) => {
+    e.preventDefault();
+    setErr('');
+    try {
+      const data = await fetch(`${API}/api/auth`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) }).then(r => r.json());
+      if (data.success) { localStorage.setItem('wa_token', data.token); onLogin(); }
+      else setErr('❌ كلمة مرور خاطئة');
+    } catch { setErr('❌ خطأ في الاتصال'); }
+  };
+  return (
+    <div className="login-page">
+      <form className="login-box" onSubmit={submit}>
+        <div className="login-icon">🛡️</div>
+        <h1>WA AI Control Panel</h1>
+        <p>Enter password to access the dashboard</p>
+        {err && <div className="login-error">{err}</div>}
+        <input className="login-input" type="password" placeholder="Password..." value={pw} onChange={e => setPw(e.target.value)} autoFocus />
+        <button className="login-btn" type="submit">🔓 Login</button>
+      </form>
+    </div>
+  );
+}
+
+// ========== MAIN APP ==========
 function App() {
+  const [auth, setAuth] = useState(!!localStorage.getItem('wa_token'));
+  const [page, setPage] = useState('dashboard');
   const [socket, setSocket] = useState(null);
   const [status, setStatus] = useState('disconnected');
-  const [qrCode, setQrCode] = useState(null);
+  const [qr, setQr] = useState(null);
   const [logs, setLogs] = useState([]);
-  const [activeTab, setActiveTab] = useState('logs');
-  const [settings, setSettings] = useState({
-    botEnabled: true,
-    botName: 'WA AI Assistant',
-    botPrompt: '',
-    ignoredNumbers: [],
-    onlyRespondTo: []
-  });
-  const [sendNumber, setSendNumber] = useState('');
-  const [sendMessage, setSendMessage] = useState('');
-  const [stats, setStats] = useState({ total: 0, replied: 0, errors: 0, ignored: 0 });
-  const logsRef = useRef(null);
+  const [settings, setSettings] = useState({ botEnabled: true, voiceTranscriptionEnabled: true });
+  const [customers, setCustomers] = useState([]);
+  const [selCustomer, setSelCustomer] = useState(null);
+  const [customerChat, setCustomerChat] = useState(null);
+  const [kb, setKb] = useState({});
+  const [kbTab, setKbTab] = useState('instructions');
+  const [sendNum, setSendNum] = useState('');
+  const [sendMsg, setSendMsg] = useState('');
 
-  // Connect to Socket.IO
   useEffect(() => {
-    const s = io(SOCKET_URL, { transports: ['websocket', 'polling'] });
-
-    s.on('connect', () => console.log('🔌 Socket connected'));
-    s.on('disconnect', () => console.log('🔌 Socket disconnected'));
-
-    s.on('status_change', (data) => {
-      setStatus(data.status);
-      if (data.status === 'connected') setQrCode(null);
-    });
-
-    s.on('qr_code', (data) => {
-      setQrCode(data.qr);
-      setStatus('qr');
-    });
-
-    s.on('new_message', (log) => {
-      setLogs(prev => [log, ...prev].slice(0, 200));
-    });
-
-    s.on('settings_update', (data) => {
-      setSettings(prev => ({ ...prev, ...data }));
-    });
-
+    if (!auth) return;
+    const s = io(API || window.location.origin, { transports: ['websocket', 'polling'] });
+    s.on('status_change', d => { setStatus(d.status); if (d.status === 'connected') setQr(null); });
+    s.on('qr_code', d => { setQr(d.qr); setStatus('qr'); });
+    s.on('new_message', log => setLogs(prev => [log, ...prev].slice(0, 500)));
+    s.on('settings_update', d => setSettings(prev => ({ ...prev, ...d })));
     s.on('logs_cleared', () => setLogs([]));
-
-    s.on('error', (data) => {
-      console.error('Server error:', data.message);
-    });
-
     setSocket(s);
-
-    // Fetch initial data
-    fetchLogs();
-    fetchStatus();
-
+    fetchLogs(); fetchStatus();
     return () => s.disconnect();
-  }, []);
+  }, [auth]);
 
-  // Calculate stats from logs
-  useEffect(() => {
-    const replied = logs.filter(l => l.type === 'auto_reply').length;
-    const errors = logs.filter(l => l.type === 'error').length;
-    const ignored = logs.filter(l => l.type === 'ignored' || l.type === 'filtered' || l.type === 'disabled').length;
-    setStats({ total: logs.length, replied, errors, ignored });
-  }, [logs]);
+  const fetchLogs = () => api('/api/logs?limit=200').then(d => setLogs(d.logs || [])).catch(() => {});
+  const fetchStatus = () => api('/api/status').then(d => { setStatus(d.connectionStatus); setSettings({ botEnabled: d.botEnabled, voiceTranscriptionEnabled: d.voiceTranscriptionEnabled }); }).catch(() => {});
+  const fetchCustomers = () => api('/api/customers').then(d => setCustomers(d)).catch(() => {});
+  const fetchCustomerChat = (phone) => { setSelCustomer(phone); api(`/api/customers/${phone}`).then(d => setCustomerChat(d)).catch(() => {}); };
+  const deleteCustomer = (phone) => { if (confirm('حذف محادثات هذا العميل؟')) api(`/api/customers/${phone}`, { method: 'DELETE' }).then(() => { fetchCustomers(); setSelCustomer(null); setCustomerChat(null); }); };
+  const loadKb = (file) => { setKbTab(file); api(`/api/knowledge/${file}`).then(d => setKb(d)).catch(() => {}); };
 
-  const fetchLogs = useCallback(async () => {
-    try {
-      const res = await fetch(`${SOCKET_URL}/api/logs?limit=200`);
-      const data = await res.json();
-      setLogs(data.logs || []);
-    } catch (err) { console.error('Failed to fetch logs'); }
-  }, []);
+  const saveKb = () => api(`/api/knowledge/${kbTab}`, { method: 'PUT', body: JSON.stringify(kb) }).then(() => alert('✅ تم الحفظ بنجاح'));
+  const updateSetting = (key, val) => api('/api/settings', { method: 'POST', body: JSON.stringify({ [key]: val }) });
+  const clearLogs = () => api('/api/clear-logs', { method: 'POST' });
+  const restart = () => api('/api/restart', { method: 'POST' });
+  const disconnect = () => api('/api/disconnect', { method: 'POST' });
+  const sendMessage = () => { if (!sendNum || !sendMsg) return; api('/api/send', { method: 'POST', body: JSON.stringify({ number: sendNum, message: sendMsg }) }).then(() => setSendMsg('')); };
 
-  const fetchStatus = useCallback(async () => {
-    try {
-      const res = await fetch(`${SOCKET_URL}/api/status`);
-      const data = await res.json();
-      setStatus(data.connectionStatus);
-      setSettings({
-        botEnabled: data.botEnabled,
-        botName: data.botName,
-        botPrompt: data.botPrompt,
-        ignoredNumbers: data.ignoredNumbers || [],
-        onlyRespondTo: data.onlyRespondTo || []
-      });
-    } catch (err) { console.error('Failed to fetch status'); }
-  }, []);
+  useEffect(() => { if (auth && page === 'customers') fetchCustomers(); }, [page, auth]);
+  useEffect(() => { if (auth && page === 'knowledge') loadKb('instructions'); }, [page, auth]);
 
-  const updateSettings = async (newSettings) => {
-    try {
-      await fetch(`${SOCKET_URL}/api/settings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(newSettings)
-      });
-      setSettings(prev => ({ ...prev, ...newSettings }));
-    } catch (err) { console.error('Failed to update settings'); }
-  };
+  const stats = { total: logs.length, replied: logs.filter(l => l.type === 'auto_reply').length, voice: logs.filter(l => l.type === 'voice_transcribed').length, errors: logs.filter(l => l.type === 'error').length };
+  const formatTime = ts => { try { return new Date(ts).toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit' }); } catch { return ''; } };
 
-  const sendMsg = async () => {
-    if (!sendNumber || !sendMessage) return;
-    try {
-      await fetch(`${SOCKET_URL}/api/send`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ number: sendNumber, message: sendMessage })
-      });
-      setSendMessage('');
-    } catch (err) { console.error('Failed to send'); }
-  };
+  if (!auth) return <LoginPage onLogin={() => setAuth(true)} />;
 
-  const handleRestart = async () => {
-    try { await fetch(`${SOCKET_URL}/api/restart`, { method: 'POST' }); }
-    catch (err) { console.error('Failed to restart'); }
-  };
-
-  const handleDisconnect = async () => {
-    try { await fetch(`${SOCKET_URL}/api/disconnect`, { method: 'POST' }); }
-    catch (err) { console.error('Failed to disconnect'); }
-  };
-
-  const clearLogs = async () => {
-    try { await fetch(`${SOCKET_URL}/api/clear-logs`, { method: 'POST' }); }
-    catch (err) { console.error('Failed to clear logs'); }
-  };
-
-  const formatTime = (ts) => {
-    try {
-      const d = new Date(ts);
-      return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    } catch { return ''; }
-  };
-
-  const getTypeLabel = (type) => {
-    const labels = {
-      auto_reply: '🤖 AI Reply',
-      error: '❌ Error',
-      ignored: '🚫 Ignored',
-      filtered: '🔒 Filtered',
-      disabled: '⏸️ Disabled',
-      outgoing_manual: '📤 Sent'
-    };
-    return labels[type] || type;
-  };
-
-  const getTypeAvatar = (type) => {
-    const avatars = { auto_reply: '🤖', error: '❌', ignored: '🚫', filtered: '🔒', disabled: '⏸️', outgoing_manual: '📤' };
-    return avatars[type] || '💬';
-  };
-
-  const statusLabels = {
-    connected: '✅ Connected',
-    disconnected: '❌ Disconnected',
-    qr: '📱 Scan QR',
-    connecting: '⏳ Connecting...'
-  };
+  const statusLabel = { connected: '🟢 Connected', disconnected: '🔴 Disconnected', qr: '🟡 Scan QR', connecting: '🟡 Connecting...' };
+  const statusClass = { connected: 'online', disconnected: 'offline', qr: 'pending', connecting: 'pending' };
 
   return (
-    <div className="app">
-      {/* Header */}
-      <header className="header">
-        <div className="header-left">
-          <div className="header-logo">🤖</div>
-          <div>
-            <div className="header-title">WA <span>AI</span> Bot</div>
-            <div className="header-subtitle">Powered by OpenRouter • GPT-OSS-120B</div>
-          </div>
+    <div className="layout">
+      {/* SIDEBAR */}
+      <aside className="sidebar">
+        <div className="sidebar-brand">
+          <div className="sidebar-logo">🤖</div>
+          <h2>WA <span>AI</span><small>Control Panel</small></h2>
         </div>
-        <div className="header-right">
-          <div className={`status-badge ${status}`}>
-            <div className="status-dot"></div>
-            {statusLabels[status] || status}
-          </div>
-          {status === 'connected' && (
-            <button className="btn btn-danger" onClick={handleDisconnect}>⏏ Disconnect</button>
-          )}
-          {status === 'disconnected' && (
-            <button className="btn btn-primary" onClick={handleRestart}>🔄 Reconnect</button>
-          )}
-        </div>
-      </header>
-
-      {/* Main Content */}
-      <div className="main-content">
-        {/* QR / Connection Section */}
-        <div className="card qr-section">
-          <div className="card-header">
-            <h2>📱 WhatsApp Connection</h2>
-          </div>
-          <div className="card-body">
-            {status === 'qr' && qrCode && (
-              <div className="qr-display">
-                <div className="qr-image-wrapper">
-                  <img className="qr-image" src={qrCode} alt="QR Code" />
-                </div>
-                <p className="qr-instruction">
-                  1. Open <strong>WhatsApp</strong> on your phone<br />
-                  2. Go to <strong>Settings → Linked Devices</strong><br />
-                  3. Tap <strong>"Link a Device"</strong><br />
-                  4. <strong>Scan this QR Code</strong>
-                </p>
+        <nav className="sidebar-nav">
+          <div className="nav-section">
+            <div className="nav-section-title">Main</div>
+            {[
+              { id: 'dashboard', icon: '📊', label: 'Dashboard' },
+              { id: 'connection', icon: '📱', label: 'Connection' },
+              { id: 'logs', icon: '📋', label: 'Message Logs', badge: stats.total },
+            ].map(n => (
+              <div key={n.id} className={`nav-item ${page === n.id ? 'active' : ''}`} onClick={() => setPage(n.id)}>
+                <span className="nav-icon">{n.icon}</span>
+                <span>{n.label}</span>
+                {n.badge > 0 && <span className="nav-badge">{n.badge}</span>}
               </div>
-            )}
-            {status === 'connected' && (
-              <div className="connected-display">
-                <div className="connected-icon">✅</div>
-                <h3>WhatsApp Connected!</h3>
-                <p>Your AI bot is active and responding to messages</p>
-                <div className="btn-group" style={{ marginTop: 10 }}>
-                  <button className="btn btn-secondary" onClick={handleRestart}>🔄 Restart</button>
-                  <button className="btn btn-danger" onClick={handleDisconnect}>⏏ Disconnect</button>
-                </div>
-              </div>
-            )}
-            {status === 'connecting' && (
-              <div className="connecting-display">
-                <div className="spinner"></div>
-                <p>Connecting to WhatsApp...</p>
-                <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>This may take a moment</p>
-              </div>
-            )}
-            {status === 'disconnected' && (
-              <div className="disconnected-display">
-                <div className="disconnected-icon">📵</div>
-                <h3 style={{ color: 'var(--accent-red)' }}>Disconnected</h3>
-                <p>Click reconnect to start the WhatsApp session</p>
-                <button className="btn btn-primary" onClick={handleRestart} style={{ marginTop: 10 }}>
-                  🔄 Start Connection
-                </button>
-              </div>
-            )}
+            ))}
           </div>
-        </div>
-
-        {/* Stats Row */}
-        <div className="stats-row">
-          <div className="stat-card green">
-            <div className="stat-icon">💬</div>
-            <div className="stat-value">{stats.total}</div>
-            <div className="stat-label">Total Messages</div>
-          </div>
-          <div className="stat-card blue">
-            <div className="stat-icon">🤖</div>
-            <div className="stat-value">{stats.replied}</div>
-            <div className="stat-label">AI Replies</div>
-          </div>
-          <div className="stat-card orange">
-            <div className="stat-icon">🚫</div>
-            <div className="stat-value">{stats.ignored}</div>
-            <div className="stat-label">Ignored</div>
-          </div>
-          <div className="stat-card purple">
-            <div className="stat-icon">❌</div>
-            <div className="stat-value">{stats.errors}</div>
-            <div className="stat-label">Errors</div>
-          </div>
-        </div>
-
-        {/* Tabs Section */}
-        <div className="card tabs-section">
-          <div className="card-header">
-            <div className="tabs-nav">
-              <button className={`tab-btn ${activeTab === 'logs' ? 'active' : ''}`} onClick={() => setActiveTab('logs')}>
-                📋 Message Logs
-              </button>
-              <button className={`tab-btn ${activeTab === 'settings' ? 'active' : ''}`} onClick={() => setActiveTab('settings')}>
-                ⚙️ Settings
-              </button>
-              <button className={`tab-btn ${activeTab === 'send' ? 'active' : ''}`} onClick={() => setActiveTab('send')}>
-                📤 Send Message
-              </button>
+          <div className="nav-section">
+            <div className="nav-section-title">Knowledge Base</div>
+            <div className={`nav-item ${page === 'knowledge' ? 'active' : ''}`} onClick={() => setPage('knowledge')}>
+              <span className="nav-icon">🧠</span><span>Knowledge Base</span>
             </div>
           </div>
-
-          {/* Logs Tab */}
-          {activeTab === 'logs' && (
-            <>
-              <div style={{ padding: '12px 20px', display: 'flex', justifyContent: 'flex-end' }}>
-                <button className="btn btn-secondary" onClick={clearLogs}>🗑️ Clear Logs</button>
+          <div className="nav-section">
+            <div className="nav-section-title">CRM</div>
+            <div className={`nav-item ${page === 'customers' ? 'active' : ''}`} onClick={() => setPage('customers')}>
+              <span className="nav-icon">👥</span><span>Customers</span>
+              {customers.length > 0 && <span className="nav-badge">{customers.length}</span>}
+            </div>
+          </div>
+          <div className="nav-section">
+            <div className="nav-section-title">Tools</div>
+            {[
+              { id: 'send', icon: '📤', label: 'Send Message' },
+              { id: 'settings', icon: '⚙️', label: 'Settings' },
+            ].map(n => (
+              <div key={n.id} className={`nav-item ${page === n.id ? 'active' : ''}`} onClick={() => setPage(n.id)}>
+                <span className="nav-icon">{n.icon}</span><span>{n.label}</span>
               </div>
-              <div className="logs-container" ref={logsRef}>
-                {logs.length === 0 ? (
-                  <div className="empty-logs">
-                    <span>📭</span>
-                    <p>No messages yet</p>
-                    <p style={{ fontSize: 12 }}>Messages will appear here in real-time</p>
-                  </div>
-                ) : (
-                  logs.map((log) => (
-                    <div key={log.id} className={`log-entry ${log.type}`}>
-                      <div className="log-avatar">{getTypeAvatar(log.type)}</div>
-                      <div className="log-content">
-                        <div className="log-header">
-                          <span className="log-phone">{log.from}</span>
-                          <span className={`log-type ${log.type}`}>{getTypeLabel(log.type)}</span>
-                          <span className="log-time">{formatTime(log.timestamp)}</span>
+            ))}
+          </div>
+        </nav>
+        <div className="sidebar-footer">
+          <div className="sidebar-status">
+            <div className={`status-dot-sm ${statusClass[status] || 'offline'}`}></div>
+            <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>{statusLabel[status] || status}</span>
+          </div>
+        </div>
+      </aside>
+
+      {/* MAIN */}
+      <div className="main">
+        <div className="topbar">
+          <h1>{{ dashboard: '📊 Dashboard', connection: '📱 Connection', logs: '📋 Message Logs', knowledge: '🧠 Knowledge Base', customers: '👥 Customers', send: '📤 Send Message', settings: '⚙️ Settings' }[page]}</h1>
+          <div className="topbar-actions">
+            {status === 'connected' && <button className="btn btn-danger btn-sm" onClick={disconnect}>⏏ Disconnect</button>}
+            {status === 'disconnected' && <button className="btn btn-primary btn-sm" onClick={restart}>🔄 Reconnect</button>}
+          </div>
+        </div>
+
+        <div className="content">
+          {/* ===== DASHBOARD ===== */}
+          {page === 'dashboard' && (
+            <>
+              <div className="stat-grid">
+                <div className="stat-box blue"><div className="stat-icon">💬</div><div className="stat-val">{stats.total}</div><div className="stat-label">Total Messages</div></div>
+                <div className="stat-box green"><div className="stat-icon">🤖</div><div className="stat-val">{stats.replied}</div><div className="stat-label">AI Replies</div></div>
+                <div className="stat-box purple"><div className="stat-icon">🎤</div><div className="stat-val">{stats.voice}</div><div className="stat-label">Voice Messages</div></div>
+                <div className="stat-box orange"><div className="stat-icon">❌</div><div className="stat-val">{stats.errors}</div><div className="stat-label">Errors</div></div>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+                <div className="card">
+                  <div className="card-head"><h3>📋 Recent Activity</h3></div>
+                  <div className="card-content">
+                    <div className="log-list" style={{ maxHeight: 300 }}>
+                      {logs.slice(0, 8).map(log => (
+                        <div key={log.id} className={`log-row ${log.type}`}>
+                          <div className="log-icon">{log.type === 'auto_reply' ? '🤖' : log.type === 'voice_transcribed' ? '🎤' : '📩'}</div>
+                          <div className="log-body">
+                            <div className="log-head"><span className="log-phone">{log.from}</span><span className="log-time">{formatTime(log.timestamp)}</span></div>
+                            <div className="log-msg">{log.body?.substring(0, 80)}</div>
+                          </div>
                         </div>
-                        <div className="log-message">📩 {log.body}</div>
-                        {log.aiResponse && (
-                          <div className="log-ai-response">🤖 {log.aiResponse}</div>
-                        )}
-                      </div>
+                      ))}
+                      {logs.length === 0 && <div className="empty"><span className="empty-icon">📭</span><p>No activity yet</p></div>}
                     </div>
-                  ))
-                )}
+                  </div>
+                </div>
+                <div className="card">
+                  <div className="card-head"><h3>⚡ Quick Status</h3></div>
+                  <div className="card-content">
+                    <div className="toggle-row"><div className="toggle-info"><div className="toggle-title">🤖 Bot Auto-Reply</div><div className="toggle-desc">AI responds automatically</div></div>
+                      <label className="toggle"><input type="checkbox" checked={settings.botEnabled} onChange={e => { setSettings(p => ({...p, botEnabled: e.target.checked})); updateSetting('botEnabled', e.target.checked); }} /><span className="toggle-track"></span></label>
+                    </div>
+                    <div className="toggle-row"><div className="toggle-info"><div className="toggle-title">🎤 Voice Transcription</div><div className="toggle-desc">Groq Whisper transcription</div></div>
+                      <label className="toggle"><input type="checkbox" checked={settings.voiceTranscriptionEnabled} onChange={e => { setSettings(p => ({...p, voiceTranscriptionEnabled: e.target.checked})); updateSetting('voiceTranscriptionEnabled', e.target.checked); }} /><span className="toggle-track"></span></label>
+                    </div>
+                    <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
+                      <button className="btn btn-primary btn-sm" onClick={restart}>🔄 Restart Bot</button>
+                      <button className="btn btn-ghost btn-sm" onClick={() => setPage('knowledge')}>🧠 Knowledge Base</button>
+                    </div>
+                  </div>
+                </div>
               </div>
             </>
           )}
 
-          {/* Settings Tab */}
-          {activeTab === 'settings' && (
-            <div className="settings-form">
-              <div className="toggle-row">
-                <div>
-                  <div className="toggle-label">🤖 Bot Enabled</div>
-                  <div className="toggle-desc">Toggle bot auto-replies on/off</div>
-                </div>
-                <label className="toggle-switch">
-                  <input
-                    type="checkbox"
-                    checked={settings.botEnabled}
-                    onChange={(e) => updateSettings({ botEnabled: e.target.checked })}
-                  />
-                  <span className="toggle-slider"></span>
-                </label>
-              </div>
-
-              <div className="form-group">
-                <label>🏷️ Bot Name</label>
-                <input
-                  type="text"
-                  value={settings.botName}
-                  onChange={(e) => setSettings(prev => ({ ...prev, botName: e.target.value }))}
-                  onBlur={(e) => updateSettings({ botName: e.target.value })}
-                  placeholder="Enter bot name..."
-                />
-              </div>
-
-              <div className="form-group">
-                <label>🧠 AI System Prompt</label>
-                <textarea
-                  value={settings.botPrompt}
-                  onChange={(e) => setSettings(prev => ({ ...prev, botPrompt: e.target.value }))}
-                  onBlur={(e) => updateSettings({ botPrompt: e.target.value })}
-                  placeholder="Define how the AI should behave..."
-                />
-              </div>
-
-              <div className="form-group">
-                <label>🚫 Ignored Numbers (comma-separated)</label>
-                <input
-                  type="text"
-                  value={(settings.ignoredNumbers || []).join(', ')}
-                  onChange={(e) => {
-                    const nums = e.target.value.split(',').map(n => n.trim()).filter(Boolean);
-                    setSettings(prev => ({ ...prev, ignoredNumbers: nums }));
-                  }}
-                  onBlur={(e) => {
-                    const nums = e.target.value.split(',').map(n => n.trim()).filter(Boolean);
-                    updateSettings({ ignoredNumbers: nums });
-                  }}
-                  placeholder="e.g. 201234567890, 201987654321"
-                />
-              </div>
-
-              <div className="form-group">
-                <label>✅ Only Respond To (comma-separated, empty = all)</label>
-                <input
-                  type="text"
-                  value={(settings.onlyRespondTo || []).join(', ')}
-                  onChange={(e) => {
-                    const nums = e.target.value.split(',').map(n => n.trim()).filter(Boolean);
-                    setSettings(prev => ({ ...prev, onlyRespondTo: nums }));
-                  }}
-                  onBlur={(e) => {
-                    const nums = e.target.value.split(',').map(n => n.trim()).filter(Boolean);
-                    updateSettings({ onlyRespondTo: nums });
-                  }}
-                  placeholder="Leave empty to respond to everyone"
-                />
+          {/* ===== CONNECTION ===== */}
+          {page === 'connection' && (
+            <div className="card">
+              <div className="card-head"><h3>📱 WhatsApp Connection</h3></div>
+              <div className="card-content">
+                {status === 'qr' && qr && (
+                  <div className="qr-container">
+                    <div className="qr-wrap"><img src={qr} alt="QR" /></div>
+                    <div className="qr-steps">1. Open <strong>WhatsApp</strong> → <strong>Settings → Linked Devices</strong><br/>2. Tap <strong>"Link a Device"</strong> → <strong>Scan this QR</strong></div>
+                  </div>
+                )}
+                {status === 'connected' && (
+                  <div className="connected-badge"><div className="con-icon">✅</div><h3>WhatsApp Connected!</h3><p style={{ color: 'var(--text-dim)', fontSize: 13 }}>Bot is active and responding</p>
+                    <div style={{ display: 'flex', gap: 8, marginTop: 8 }}><button className="btn btn-ghost" onClick={restart}>🔄 Restart</button><button className="btn btn-danger" onClick={disconnect}>⏏ Disconnect</button></div>
+                  </div>
+                )}
+                {status === 'disconnected' && <div className="connected-badge"><div className="con-icon" style={{ background: 'rgba(239,68,68,.1)', borderColor: 'rgba(239,68,68,.2)' }}>📵</div><h3 style={{ color: 'var(--red)' }}>Disconnected</h3><button className="btn btn-primary" onClick={restart}>🔄 Start Connection</button></div>}
+                {status === 'connecting' && <div className="connected-badge"><div className="con-icon" style={{ background: 'rgba(245,158,11,.1)', borderColor: 'rgba(245,158,11,.2)' }}>⏳</div><h3 style={{ color: 'var(--orange)' }}>Connecting...</h3></div>}
               </div>
             </div>
           )}
 
-          {/* Send Message Tab */}
-          {activeTab === 'send' && (
-            <div className="send-form">
-              <p style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
-                Send a manual message to any WhatsApp number
-              </p>
-              <div className="form-group">
-                <label>📱 Phone Number (with country code)</label>
-                <input
-                  type="text"
-                  value={sendNumber}
-                  onChange={(e) => setSendNumber(e.target.value)}
-                  placeholder="e.g. 201234567890"
-                />
+          {/* ===== LOGS ===== */}
+          {page === 'logs' && (
+            <div className="card">
+              <div className="card-head"><h3>📋 Message Logs ({logs.length})</h3><button className="btn btn-ghost btn-sm" onClick={clearLogs}>🗑️ Clear</button></div>
+              <div className="card-content">
+                <div className="log-list">
+                  {logs.map(log => (
+                    <div key={log.id} className={`log-row ${log.type}`}>
+                      <div className="log-icon">{log.type === 'auto_reply' ? '🤖' : log.type === 'error' ? '❌' : log.type === 'voice_transcribed' ? '🎤' : '📩'}</div>
+                      <div className="log-body">
+                        <div className="log-head"><span className="log-phone">{log.from}</span><span className={`log-tag ${log.type}`}>{log.type.replace('_', ' ')}</span><span className="log-time">{formatTime(log.timestamp)}</span></div>
+                        <div className="log-msg">{log.body}</div>
+                        {log.aiResponse && <div className="log-ai">🤖 {log.aiResponse}</div>}
+                      </div>
+                    </div>
+                  ))}
+                  {logs.length === 0 && <div className="empty"><span className="empty-icon">📭</span><p>No messages yet</p></div>}
+                </div>
               </div>
-              <div className="form-group">
-                <label>💬 Message</label>
-                <textarea
-                  value={sendMessage}
-                  onChange={(e) => setSendMessage(e.target.value)}
-                  placeholder="Type your message..."
-                  style={{ minHeight: 80 }}
-                />
+            </div>
+          )}
+
+          {/* ===== KNOWLEDGE BASE ===== */}
+          {page === 'knowledge' && (
+            <div className="card">
+              <div className="card-head"><h3>🧠 Knowledge Base</h3><button className="btn btn-primary btn-sm" onClick={saveKb}>💾 Save Changes</button></div>
+              <div className="card-content">
+                <div className="kb-tabs">
+                  {[{ id: 'instructions', icon: '🏢', label: 'Instructions' }, { id: 'pricing', icon: '💰', label: 'Pricing' }, { id: 'persona', icon: '🎭', label: 'Persona' }, { id: 'routes', icon: '📞', label: 'Routes' }].map(t => (
+                    <button key={t.id} className={`kb-tab ${kbTab === t.id ? 'active' : ''}`} onClick={() => loadKb(t.id)}>{t.icon} {t.label}</button>
+                  ))}
+                </div>
+                <KnowledgeEditor data={kb} onChange={setKb} tab={kbTab} />
               </div>
-              <button
-                className="btn btn-primary"
-                onClick={sendMsg}
-                disabled={status !== 'connected' || !sendNumber || !sendMessage}
-                style={{ opacity: (status !== 'connected' || !sendNumber || !sendMessage) ? 0.5 : 1 }}
-              >
-                📤 Send Message
-              </button>
-              {status !== 'connected' && (
-                <p style={{ color: 'var(--accent-red)', fontSize: 12 }}>
-                  ⚠️ WhatsApp must be connected to send messages
-                </p>
-              )}
+            </div>
+          )}
+
+          {/* ===== CUSTOMERS ===== */}
+          {page === 'customers' && (
+            <div className="customer-grid">
+              <div className="card">
+                <div className="card-head"><h3>👥 Customers ({customers.length})</h3><button className="btn btn-ghost btn-sm" onClick={fetchCustomers}>🔄</button></div>
+                <div className="card-content customer-list">
+                  {customers.map(c => (
+                    <div key={c.phone} className={`customer-item ${selCustomer === c.phone ? 'active' : ''}`} onClick={() => fetchCustomerChat(c.phone)}>
+                      <div className="customer-avatar">👤</div>
+                      <div className="customer-info"><div className="name">{c.phone}</div><div className="meta">{c.messageCount} msgs • {c.lastContact ? formatTime(c.lastContact) : 'N/A'}</div></div>
+                    </div>
+                  ))}
+                  {customers.length === 0 && <div className="empty"><span className="empty-icon">👥</span><p>No customers yet</p></div>}
+                </div>
+              </div>
+              <div className="card">
+                <div className="card-head"><h3>💬 {selCustomer || 'Select a customer'}</h3>{selCustomer && <button className="btn btn-danger btn-sm" onClick={() => deleteCustomer(selCustomer)}>🗑️ Delete</button>}</div>
+                <div className="card-content" style={{ padding: 0 }}>
+                  {customerChat ? (
+                    <div className="customer-chat">
+                      {customerChat.messages?.map((m, i) => (
+                        <div key={i} className={`chat-bubble ${m.role}`}>
+                          {m.content}
+                          <div className="chat-time">{formatTime(m.timestamp)}</div>
+                        </div>
+                      ))}
+                      {customerChat.messages?.length === 0 && <div className="empty"><p>No messages</p></div>}
+                    </div>
+                  ) : <div className="empty"><span className="empty-icon">💬</span><p>Select a customer to view chat</p></div>}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ===== SEND MESSAGE ===== */}
+          {page === 'send' && (
+            <div className="card">
+              <div className="card-head"><h3>📤 Send Manual Message</h3></div>
+              <div className="card-content">
+                <div className="form-group"><label>📱 Phone (with country code)</label><input className="form-input" value={sendNum} onChange={e => setSendNum(e.target.value)} placeholder="201234567890" /></div>
+                <div className="form-group"><label>💬 Message</label><textarea className="form-textarea" value={sendMsg} onChange={e => setSendMsg(e.target.value)} placeholder="Type message..." /></div>
+                <button className="btn btn-primary" onClick={sendMessage} disabled={status !== 'connected'}>📤 Send</button>
+                {status !== 'connected' && <p style={{ color: 'var(--red)', fontSize: 11, marginTop: 8 }}>⚠️ WhatsApp must be connected</p>}
+              </div>
+            </div>
+          )}
+
+          {/* ===== SETTINGS ===== */}
+          {page === 'settings' && (
+            <div className="card">
+              <div className="card-head"><h3>⚙️ Bot Settings</h3></div>
+              <div className="card-content">
+                <div className="toggle-row"><div className="toggle-info"><div className="toggle-title">🤖 Bot Auto-Reply</div><div className="toggle-desc">Enable/disable automatic AI responses</div></div>
+                  <label className="toggle"><input type="checkbox" checked={settings.botEnabled} onChange={e => { setSettings(p => ({...p, botEnabled: e.target.checked})); updateSetting('botEnabled', e.target.checked); }} /><span className="toggle-track"></span></label>
+                </div>
+                <div className="toggle-row"><div className="toggle-info"><div className="toggle-title">🎤 Voice Transcription</div><div className="toggle-desc">Transcribe voice messages with Groq Whisper</div></div>
+                  <label className="toggle"><input type="checkbox" checked={settings.voiceTranscriptionEnabled} onChange={e => { setSettings(p => ({...p, voiceTranscriptionEnabled: e.target.checked})); updateSetting('voiceTranscriptionEnabled', e.target.checked); }} /><span className="toggle-track"></span></label>
+                </div>
+                <div style={{ display: 'flex', gap: 10, marginTop: 20 }}>
+                  <button className="btn btn-primary" onClick={restart}>🔄 Restart Bot</button>
+                  <button className="btn btn-danger" onClick={disconnect}>⏏ Disconnect</button>
+                  <button className="btn btn-ghost" onClick={() => { localStorage.removeItem('wa_token'); window.location.reload(); }}>🚪 Logout</button>
+                </div>
+              </div>
             </div>
           )}
         </div>
       </div>
     </div>
   );
+}
+
+// ========== KNOWLEDGE EDITOR ==========
+function KnowledgeEditor({ data, onChange, tab }) {
+  const update = (key, val) => onChange({ ...data, [key]: val });
+  const updateNested = (arrKey, idx, field, val) => {
+    const arr = [...(data[arrKey] || [])];
+    arr[idx] = { ...arr[idx], [field]: val };
+    onChange({ ...data, [arrKey]: arr });
+  };
+  const addItem = (arrKey, template) => onChange({ ...data, [arrKey]: [...(data[arrKey] || []), template] });
+  const removeItem = (arrKey, idx) => { const arr = [...(data[arrKey] || [])]; arr.splice(idx, 1); onChange({ ...data, [arrKey]: arr }); };
+
+  if (tab === 'instructions') return (
+    <div>
+      {['companyName', 'description', 'workingHours', 'address', 'email', 'website'].map(k => (
+        <div className="form-group" key={k}><label>{k}</label><input className="form-input" value={data[k] || ''} onChange={e => update(k, e.target.value)} /></div>
+      ))}
+      <div className="form-group"><label>About (detailed)</label><textarea className="form-textarea" value={data.about || ''} onChange={e => update('about', e.target.value)} /></div>
+      <div className="form-group"><label>Additional Info</label><textarea className="form-textarea" value={data.additionalInfo || ''} onChange={e => update('additionalInfo', e.target.value)} /></div>
+      <h4 style={{ margin: '16px 0 8px', fontSize: 13 }}>❓ FAQ</h4>
+      {(data.faq || []).map((f, i) => (
+        <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+          <input className="form-input" placeholder="Question" value={f.question} onChange={e => updateNested('faq', i, 'question', e.target.value)} style={{ flex: 1 }} />
+          <input className="form-input" placeholder="Answer" value={f.answer} onChange={e => updateNested('faq', i, 'answer', e.target.value)} style={{ flex: 1 }} />
+          <button className="btn btn-danger btn-sm" onClick={() => removeItem('faq', i)}>✕</button>
+        </div>
+      ))}
+      <button className="btn btn-ghost btn-sm" onClick={() => addItem('faq', { question: '', answer: '' })}>+ Add FAQ</button>
+    </div>
+  );
+
+  if (tab === 'pricing') return (
+    <div>
+      {(data.categories || []).map((cat, ci) => (
+        <div key={ci} className="card" style={{ marginBottom: 16 }}>
+          <div className="card-head"><input className="form-input" value={cat.name} onChange={e => { const cats = [...(data.categories || [])]; cats[ci] = { ...cats[ci], name: e.target.value }; update('categories', cats); }} style={{ border: 'none', background: 'transparent', fontWeight: 600, fontSize: 14, padding: 0 }} />
+            <button className="btn btn-danger btn-sm" onClick={() => removeItem('categories', ci)}>✕</button></div>
+          <div className="card-content">
+            {(cat.items || []).map((item, ii) => (
+              <div key={ii} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 100px auto', gap: 8, marginBottom: 8 }}>
+                <input className="form-input" placeholder="Name" value={item.name} onChange={e => { const cats = [...(data.categories || [])]; cats[ci].items[ii] = { ...cats[ci].items[ii], name: e.target.value }; update('categories', cats); }} />
+                <input className="form-input" placeholder="Description" value={item.description || ''} onChange={e => { const cats = [...(data.categories || [])]; cats[ci].items[ii] = { ...cats[ci].items[ii], description: e.target.value }; update('categories', cats); }} />
+                <input className="form-input" placeholder="Price" value={item.price || ''} onChange={e => { const cats = [...(data.categories || [])]; cats[ci].items[ii] = { ...cats[ci].items[ii], price: e.target.value }; update('categories', cats); }} />
+                <button className="btn btn-danger btn-sm" onClick={() => { const cats = [...(data.categories || [])]; cats[ci].items.splice(ii, 1); update('categories', cats); }}>✕</button>
+              </div>
+            ))}
+            <button className="btn btn-ghost btn-sm" onClick={() => { const cats = [...(data.categories || [])]; cats[ci].items = [...(cats[ci].items || []), { name: '', description: '', price: '', available: true }]; update('categories', cats); }}>+ Add Item</button>
+          </div>
+        </div>
+      ))}
+      <button className="btn btn-primary btn-sm" onClick={() => addItem('categories', { name: 'New Category', items: [] })}>+ Add Category</button>
+      <h4 style={{ margin: '20px 0 8px', fontSize: 13 }}>🏷️ Offers</h4>
+      {(data.offers || []).map((o, i) => (
+        <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 80px 100px auto', gap: 8, marginBottom: 8 }}>
+          <input className="form-input" placeholder="Offer name" value={o.name} onChange={e => updateNested('offers', i, 'name', e.target.value)} />
+          <input className="form-input" placeholder="Description" value={o.description || ''} onChange={e => updateNested('offers', i, 'description', e.target.value)} />
+          <input className="form-input" placeholder="Discount" value={o.discount || ''} onChange={e => updateNested('offers', i, 'discount', e.target.value)} />
+          <input className="form-input" type="date" value={o.validUntil || ''} onChange={e => updateNested('offers', i, 'validUntil', e.target.value)} />
+          <button className="btn btn-danger btn-sm" onClick={() => removeItem('offers', i)}>✕</button>
+        </div>
+      ))}
+      <button className="btn btn-ghost btn-sm" onClick={() => addItem('offers', { name: '', description: '', discount: '', validUntil: '', active: true })}>+ Add Offer</button>
+    </div>
+  );
+
+  if (tab === 'persona') return (
+    <div>
+      {['name', 'personality', 'tone', 'language', 'greeting', 'farewell'].map(k => (
+        <div className="form-group" key={k}><label>{k}</label>{k === 'greeting' || k === 'farewell' ? <textarea className="form-textarea" style={{ minHeight: 60 }} value={data[k] || ''} onChange={e => update(k, e.target.value)} /> : <input className="form-input" value={data[k] || ''} onChange={e => update(k, e.target.value)} />}</div>
+      ))}
+      <div className="form-group"><label>Rules (one per line)</label><textarea className="form-textarea" value={(data.rules || []).join('\n')} onChange={e => update('rules', e.target.value.split('\n').filter(Boolean))} /></div>
+      <div className="form-group"><label>Do NOT discuss (one per line)</label><textarea className="form-textarea" value={(data.doNotDiscuss || []).join('\n')} onChange={e => update('doNotDiscuss', e.target.value.split('\n').filter(Boolean))} /></div>
+      <div className="form-group"><label>Custom Instructions</label><textarea className="form-textarea" style={{ minHeight: 120 }} value={data.customInstructions || ''} onChange={e => update('customInstructions', e.target.value)} /></div>
+    </div>
+  );
+
+  if (tab === 'routes') return (
+    <div>
+      <div className="form-group"><label>Transfer confirmation message</label><textarea className="form-textarea" value={data.transferMessage || ''} onChange={e => update('transferMessage', e.target.value)} /></div>
+      <div className="form-group"><label>Transfer keywords (comma-separated)</label><input className="form-input" value={(data.transferKeywords || []).join(', ')} onChange={e => update('transferKeywords', e.target.value.split(',').map(s => s.trim()).filter(Boolean))} /></div>
+      <h4 style={{ margin: '16px 0 8px', fontSize: 13 }}>📞 Departments</h4>
+      {(data.departments || []).map((d, i) => (
+        <div key={i} className="card" style={{ marginBottom: 12 }}>
+          <div className="card-content" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <div className="form-group"><label>Name</label><input className="form-input" value={d.name} onChange={e => updateNested('departments', i, 'name', e.target.value)} /></div>
+            <div className="form-group"><label>Phone</label><input className="form-input" value={d.phone} onChange={e => updateNested('departments', i, 'phone', e.target.value)} /></div>
+            <div className="form-group"><label>Description</label><input className="form-input" value={d.description || ''} onChange={e => updateNested('departments', i, 'description', e.target.value)} /></div>
+            <div className="form-group"><label>Keywords (comma)</label><input className="form-input" value={(d.keywords || []).join(', ')} onChange={e => { const deps = [...(data.departments || [])]; deps[i] = { ...deps[i], keywords: e.target.value.split(',').map(s => s.trim()).filter(Boolean) }; onChange({ ...data, departments: deps }); }} /></div>
+            <button className="btn btn-danger btn-sm" onClick={() => removeItem('departments', i)}>✕ Remove</button>
+          </div>
+        </div>
+      ))}
+      <button className="btn btn-primary btn-sm" onClick={() => addItem('departments', { name: '', phone: '', keywords: [], description: '' })}>+ Add Department</button>
+    </div>
+  );
+
+  return null;
 }
 
 export default App;

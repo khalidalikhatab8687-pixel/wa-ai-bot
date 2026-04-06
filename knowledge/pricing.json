@@ -1,0 +1,27 @@
+{
+  "categories": [
+    {
+      "name": "الخدمات الأساسية",
+      "items": [
+        {
+          "name": "خدمة أساسية",
+          "description": "وصف الخدمة هنا",
+          "price": "100 جنيه",
+          "currency": "EGP",
+          "details": "تفاصيل إضافية عن الخدمة",
+          "available": true
+        }
+      ]
+    }
+  ],
+  "offers": [
+    {
+      "name": "عرض خاص",
+      "description": "وصف العرض",
+      "discount": "20%",
+      "validUntil": "2026-12-31",
+      "active": true
+    }
+  ],
+  "notes": "ملاحظات إضافية عن الأسعار"
+}
