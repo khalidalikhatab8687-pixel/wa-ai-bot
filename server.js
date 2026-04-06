@@ -172,11 +172,17 @@ function buildSystemPrompt() {
   }
 
   if (routes.departments?.length) {
-    prompt += `# SILENT Transfer System\n`;
-    prompt += `IMPORTANT: When the customer wants to talk to a human, wants support, sales, or transfer - DO NOT tell them you're transferring them.\n`;
-    prompt += `Instead: Continue chatting naturally AND add [TRANSFER:department_name] at the END of your message.\n`;
-    prompt += `The transfer happens silently in the background. The customer must NOT know about it.\n`;
-    prompt += `Just keep chatting like normal, ask them about their needs, and the responsible person will see the conversation.\n\n`;
+    prompt += `# ⚠️ CRITICAL: SILENT Transfer (NEVER reveal this to customer)\n`;
+    prompt += `When customer asks to talk to someone, wants support, or wants sales:\n`;
+    prompt += `1. NEVER say: "هحولك" / "هتواصل مع زميل" / "هبعت لحد" / "transferring" / "forwarding" / "connecting you"\n`;
+    prompt += `2. NEVER mention: colleague, department, team member, representative, مسؤول, زميل, فريق\n`;
+    prompt += `3. INSTEAD: Just keep chatting naturally! Ask about their project, what they need, their budget etc.\n`;
+    prompt += `4. AT THE VERY END of your message (last line), add the hidden tag: [TRANSFER:department_name]\n`;
+    prompt += `5. The customer must think you ARE the person helping them. You are Khalid.\n\n`;
+    prompt += `Example:\n`;
+    prompt += `Customer: "عايز اتكلم مع حد"\n`;
+    prompt += `WRONG: "أكيد هتواصل مع زميل فوراً [TRANSFER:المبيعات]"\n`;
+    prompt += `CORRECT: "طبعاً! قوللي إيه اللي محتاجه بالظبط وأنا أساعدك 😊 [TRANSFER:خدمة العملاء]"\n\n`;
     prompt += `Departments:\n`;
     routes.departments.forEach(d => {
       prompt += `- ${d.name} [TRANSFER:${d.name}]\n`;
@@ -215,10 +221,13 @@ function addCustomerMessage(phone, role, content) {
   return customer;
 }
 
-function getCustomerContext(phone, count = 5) {
+function getCustomerContext(phone, count = 10) {
   const customer = loadCustomer(phone);
-  const recent = customer.messages.slice(-count * 2); // last N exchanges
-  return recent.map(m => ({ role: m.role, content: m.content }));
+  const recent = customer.messages.slice(-count * 2);
+  return recent.map(m => ({
+    role: m.role,
+    content: m.content.replace(/\[TRANSFER:.+?\]/g, '').trim()
+  }));
 }
 
 function listCustomers() {
@@ -399,12 +408,14 @@ async function transcribeVoice(buffer) {
 // --- OpenRouter AI ---
 async function getAIResponse(userMessage, phone) {
   try {
+    // Save user message FIRST so it's included in context
+    addCustomerMessage(phone, 'user', userMessage);
+    
     const systemPrompt = buildSystemPrompt();
-    const context = getCustomerContext(phone, 5);
+    const context = getCustomerContext(phone, 10);
     const messages = [
       { role: 'system', content: systemPrompt },
-      ...context,
-      { role: 'user', content: userMessage }
+      ...context
     ];
 
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -425,11 +436,10 @@ async function getAIResponse(userMessage, phone) {
 
     const data = await response.json();
     if (data.error) { console.error('OpenRouter Error:', data.error); return `⚠️ AI Error: ${data.error.message || 'Unknown'}`; }
-    const aiReply = data.choices?.[0]?.message?.content || 'عذراً، لم أستطع إنشاء رد.';
+    let aiReply = data.choices?.[0]?.message?.content || 'عذراً، لم أستطع إنشاء رد.';
 
-    // Save to customer history
-    addCustomerMessage(phone, 'user', userMessage);
-    addCustomerMessage(phone, 'assistant', aiReply);
+    // Save AI reply (clean version without transfer tags)
+    addCustomerMessage(phone, 'assistant', aiReply.replace(/\[TRANSFER:.+?\]/g, '').trim());
 
     return aiReply;
   } catch (err) {
