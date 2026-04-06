@@ -48,6 +48,7 @@ let messageLogs = [];
 const MAX_LOGS = 500;
 let botEnabled = true;
 let voiceTranscriptionEnabled = true;
+let isRestarting = false;
 
 // --- Knowledge Base Helpers ---
 function loadKnowledge(file) {
@@ -293,10 +294,11 @@ app.post('/api/disconnect', authMiddleware, async (req, res) => {
 
 app.post('/api/restart', authMiddleware, async (req, res) => {
   try {
+    isRestarting = true;
     if (whatsappSocket) { try { whatsappSocket.end(); } catch(e) {} whatsappSocket = null; }
     connectionStatus = 'disconnected'; currentQR = null;
     io.emit('status_change', { status: connectionStatus });
-    startWhatsApp();
+    setTimeout(() => { isRestarting = false; startWhatsApp(); }, 2000);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -467,6 +469,10 @@ async function startWhatsApp() {
         const sc = lastDisconnect?.error?.output?.statusCode;
         console.log(`❌ Connection closed. Status: ${sc}`);
         currentQR = null; whatsappSocket = null;
+        if (isRestarting) {
+          console.log('🔄 Manual restart in progress, skipping auto-reconnect');
+          return;
+        }
         if (sc === DisconnectReason.loggedOut) {
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
