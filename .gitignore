@@ -1,0 +1,7 @@
+node_modules/
+.env
+tokens/
+auth_info/
+client/node_modules/
+client/dist/
+*.log

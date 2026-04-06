@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: wa-ai-bot
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    plan: free
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openai/gpt-oss-120b:free
+      - key: PORT
+        value: 3000
+      - key: BOT_NAME
+        value: WA AI Assistant
+      - key: BOT_PROMPT
+        value: "You are a helpful AI assistant responding on WhatsApp. Be concise, friendly, and helpful. Respond in the same language the user writes in."
+      - key: NODE_VERSION
+        value: "20.11.0"
+    healthCheckPath: /health

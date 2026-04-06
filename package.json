@@ -1,0 +1,32 @@
+{
+  "name": "wa-ai-bot",
+  "version": "1.0.0",
+  "description": "AI WhatsApp Auto-Responder with Baileys + OpenRouter",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "client:install": "cd client && npm install",
+    "client:build": "cd client && npm run build",
+    "client:dev": "cd client && npm run dev",
+    "postinstall": "npm run client:install && npm run client:build",
+    "dev:full": "concurrently \"npm run dev\" \"npm run client:dev\""
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.21.0",
+    "socket.io": "^4.7.5",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^2.7.0",
+    "qrcode": "^1.5.4",
+    "pino": "^9.4.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
