@@ -92,6 +92,81 @@ async function restoreAuthFromGitHub() {
   } catch (err) { console.error('Auth restore error:', err.message); return false; }
 }
 
+// --- Data Backup/Restore (Knowledge + Customers) ---
+let dataGistId = process.env.DATA_GIST_ID || '';
+let lastDataBackupTime = 0;
+
+async function backupDataToGitHub() {
+  if (!GITHUB_TOKEN) return;
+  const now = Date.now();
+  if (now - lastDataBackupTime < 60000) return; // max once per minute
+  lastDataBackupTime = now;
+  
+  try {
+    const files = {};
+    
+    // Backup knowledge files
+    const kbFiles = ['instructions', 'pricing', 'persona', 'routes'];
+    for (const name of kbFiles) {
+      const fp = path.join(KNOWLEDGE_DIR, `${name}.json`);
+      if (fs.existsSync(fp)) {
+        files[`kb_${name}.json`] = { content: fs.readFileSync(fp, 'utf8') };
+      }
+    }
+    
+    // Backup customer files
+    if (fs.existsSync(CUSTOMERS_DIR)) {
+      const customerFiles = fs.readdirSync(CUSTOMERS_DIR).filter(f => f.endsWith('.json'));
+      for (const cf of customerFiles) {
+        const fp = path.join(CUSTOMERS_DIR, cf);
+        files[`customer_${cf}`] = { content: fs.readFileSync(fp, 'utf8') };
+      }
+    }
+    
+    if (Object.keys(files).length === 0) return;
+    
+    const headers = { Authorization: `token ${GITHUB_TOKEN}`, 'Content-Type': 'application/json' };
+    if (dataGistId) {
+      await fetch(`https://api.github.com/gists/${dataGistId}`, { method: 'PATCH', headers, body: JSON.stringify({ files }) });
+      console.log(`💾 Data backed up (${Object.keys(files).length} files)`);
+    } else {
+      const res = await fetch('https://api.github.com/gists', { method: 'POST', headers, body: JSON.stringify({ description: 'WA Bot Data Backup', public: false, files }) });
+      const data = await res.json();
+      if (data.id) {
+        dataGistId = data.id;
+        console.log(`💾 Data backup created. GIST ID: ${dataGistId}`);
+        console.log(`⚠️ Add DATA_GIST_ID=${dataGistId} to your environment variables!`);
+      }
+    }
+  } catch (err) { console.error('Data backup error:', err.message); }
+}
+
+async function restoreDataFromGitHub() {
+  if (!GITHUB_TOKEN || !dataGistId) return false;
+  try {
+    const res = await fetch(`https://api.github.com/gists/${dataGistId}`, { headers: { Authorization: `token ${GITHUB_TOKEN}` } });
+    const data = await res.json();
+    if (!data.files) return false;
+    
+    let kbCount = 0, custCount = 0;
+    for (const [name, file] of Object.entries(data.files)) {
+      if (name.startsWith('kb_')) {
+        const kbName = name.replace('kb_', '');
+        const target = path.join(KNOWLEDGE_DIR, kbName);
+        fs.writeFileSync(target, file.content, 'utf8');
+        kbCount++;
+      } else if (name.startsWith('customer_')) {
+        const custName = name.replace('customer_', '');
+        const target = path.join(CUSTOMERS_DIR, custName);
+        fs.writeFileSync(target, file.content, 'utf8');
+        custCount++;
+      }
+    }
+    console.log(`💾 Data restored: ${kbCount} KB files, ${custCount} customers`);
+    return true;
+  } catch (err) { console.error('Data restore error:', err.message); return false; }
+}
+
 // --- State ---
 let whatsappSocket = null;
 let connectionStatus = 'disconnected';
@@ -218,6 +293,8 @@ function addCustomerMessage(phone, role, content) {
   customer.messages.push({ role, content, timestamp: new Date().toISOString() });
   customer.lastContact = new Date().toISOString();
   saveCustomer(phone, customer);
+  // Trigger data backup (debounced)
+  backupDataToGitHub();
   return customer;
 }
 
@@ -256,6 +333,11 @@ setInterval(() => {
   const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 3000}`;
   fetch(`${url}/health`).catch(() => {});
 }, 4 * 60 * 1000); // every 4 minutes
+
+// Periodic data backup every 5 minutes
+setInterval(() => {
+  backupDataToGitHub();
+}, 5 * 60 * 1000);
 
 // --- Dashboard Auth ---
 app.post('/api/auth', (req, res) => {
@@ -317,6 +399,9 @@ app.put('/api/knowledge/:file', authMiddleware, (req, res) => {
   const allowed = ['instructions', 'pricing', 'persona', 'routes'];
   if (!allowed.includes(req.params.file)) return res.status(400).json({ error: 'Invalid file' });
   saveKnowledge(req.params.file, req.body);
+  // Backup to GitHub after KB change
+  lastDataBackupTime = 0; // reset debounce to force backup
+  backupDataToGitHub();
   res.json({ success: true });
 });
 
@@ -685,11 +770,13 @@ io.on('connection', (socket) => {
 
 // --- Start ---
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', async () => {
   console.log(`\n🌐 Server running on http://localhost:${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
   console.log(`🤖 AI Model: ${process.env.OPENROUTER_MODEL}`);
   console.log(`🎤 Voice Transcription: ${process.env.GROQ_API_KEY ? 'Enabled' : 'Disabled'}`);
   console.log('');
+  // Restore data (knowledge + customers) from GitHub backup
+  await restoreDataFromGitHub();
   startWhatsApp();
 });
