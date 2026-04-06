@@ -151,38 +151,41 @@ function buildSystemPrompt() {
   }
 
   if (pricing.categories?.length) {
-    prompt += `# Products & Services\n`;
+    prompt += `# Services (summarized)\n`;
     pricing.categories.forEach(cat => {
-      prompt += `## ${cat.name}\n`;
-      cat.items?.forEach(item => {
-        prompt += `- ${item.name}: ${item.price} - ${item.description || ''} ${item.details || ''} ${item.available ? '(Available)' : '(Unavailable)'}\n`;
-      });
-      prompt += '\n';
+      prompt += `## ${cat.name}\n${cat.summary || ''}\n`;
+      prompt += `Services: ${cat.items?.map(i => `${i.name} (${i.price})`).join(' | ')}\n\n`;
     });
+  }
+
+  if (pricing.notes) {
+    prompt += `# Pricing Note\n${pricing.notes}\n\n`;
   }
 
   if (pricing.offers?.length) {
-    prompt += `# Current Offers\n`;
-    pricing.offers.filter(o => o.active).forEach(o => {
-      prompt += `- ${o.name}: ${o.description} (Discount: ${o.discount}, Valid until: ${o.validUntil})\n`;
-    });
-    prompt += '\n';
+    const activeOffers = pricing.offers.filter(o => o.active);
+    if (activeOffers.length) {
+      prompt += `# Offers\n`;
+      activeOffers.forEach(o => { prompt += `- ${o.name}: ${o.description} (${o.discount})\n`; });
+      prompt += '\n';
+    }
   }
 
   if (routes.departments?.length) {
-    prompt += `# Transfer/Routing\n`;
-    prompt += `When a customer wants to talk to a human or requests transfer, identify the department and respond with EXACTLY this format on a new line:\n`;
-    prompt += `[TRANSFER:department_name]\n`;
-    prompt += `Available departments:\n`;
+    prompt += `# SILENT Transfer System\n`;
+    prompt += `IMPORTANT: When the customer wants to talk to a human, wants support, sales, or transfer - DO NOT tell them you're transferring them.\n`;
+    prompt += `Instead: Continue chatting naturally AND add [TRANSFER:department_name] at the END of your message.\n`;
+    prompt += `The transfer happens silently in the background. The customer must NOT know about it.\n`;
+    prompt += `Just keep chatting like normal, ask them about their needs, and the responsible person will see the conversation.\n\n`;
+    prompt += `Departments:\n`;
     routes.departments.forEach(d => {
-      prompt += `- ${d.name}: ${d.description} (keywords: ${d.keywords.join(', ')})\n`;
+      prompt += `- ${d.name} [TRANSFER:${d.name}]\n`;
     });
-    prompt += `\nTransfer keywords: ${routes.transferKeywords?.join(', ') || ''}\n`;
-    prompt += `When you detect a transfer request, include [TRANSFER:department_name] at the END of your response.\n`;
+    prompt += `\nTrigger keywords: ${routes.transferKeywords?.slice(0, 10).join(', ') || ''}\n`;
   }
 
-  prompt += `\n# Greeting\nUse this greeting for new customers: "${persona.greeting || 'Welcome!'}"\n`;
-  prompt += `# Farewell\nUse this farewell: "${persona.farewell || 'Thank you!'}"\n`;
+  prompt += `\n# Greeting\n"${persona.greeting || 'Welcome!'}"\n`;
+  prompt += `# Farewell\n"${persona.farewell || 'Thank you!'}"\n`;
 
   return prompt;
 }
@@ -435,7 +438,7 @@ async function getAIResponse(userMessage, phone) {
   }
 }
 
-// --- Route Forwarding ---
+// --- Route Forwarding (Silent - customer doesn't know) ---
 async function handleTransfer(aiResponse, customerPhone, sock) {
   const transferMatch = aiResponse.match(/\[TRANSFER:(.+?)\]/);
   if (!transferMatch) return aiResponse;
@@ -444,9 +447,9 @@ async function handleTransfer(aiResponse, customerPhone, sock) {
   const routes = loadKnowledge('routes');
   const dept = routes.departments?.find(d => d.name === deptName || d.name.includes(deptName));
 
-  if (!dept) return aiResponse.replace(/\[TRANSFER:.+?\]/, '');
+  if (!dept) return aiResponse.replace(/\[TRANSFER:.+?\]/g, '').trim();
 
-  // Get last 5 messages
+  // Get last 5 messages for context
   const customer = loadCustomer(customerPhone);
   const lastMessages = customer.messages.slice(-10).map(m => `${m.role === 'user' ? '👤 العميل' : '🤖 البوت'}: ${m.content}`).join('\n');
 
@@ -457,19 +460,26 @@ async function handleTransfer(aiResponse, customerPhone, sock) {
     `📅 *الوقت:* ${new Date().toLocaleString('ar-EG')}\n\n` +
     `💬 *آخر المحادثات:*\n${lastMessages}`;
 
-  // Send to responsible person
+  // Send to responsible person in background
   try {
     const responsibleJid = `${dept.phone}@s.whatsapp.net`;
     await sock.sendMessage(responsibleJid, { text: transferMsg });
-    console.log(`📲 Transfer sent to ${dept.name} (${dept.phone})`);
+    console.log(`📲 Silent transfer to ${dept.name} (${dept.phone})`);
+    addLog('transfer', customerPhone, `Transfer → ${dept.name}`, dept.phone);
   } catch (err) {
     console.error('Transfer error:', err.message);
   }
 
-  // Return clean response + transfer confirmation
-  const cleanResponse = aiResponse.replace(/\[TRANSFER:.+?\]/, '').trim();
-  const transferConfirm = routes.transferMessage || '✅ تم إرسال طلبك للشخص المسؤول وسيتم التواصل معكم في أسرع وقت.';
-  return cleanResponse ? `${cleanResponse}\n\n${transferConfirm}` : transferConfirm;
+  // SILENT: Just remove the [TRANSFER:x] tag and return the normal response
+  // The customer continues chatting normally - they don't know about the transfer
+  const cleanResponse = aiResponse.replace(/\[TRANSFER:.+?\]/g, '').trim();
+  
+  // If the AI only sent a transfer tag with no text, give a natural response
+  if (!cleanResponse) {
+    return 'تمام، خليني أساعدك في ده. إيه التفاصيل اللي تحب تقولهالي عن اللي محتاجه بالظبط؟ 😊';
+  }
+  
+  return cleanResponse;
 }
 
 // --- WhatsApp ---
