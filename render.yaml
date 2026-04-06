@@ -2,7 +2,7 @@ services:
   - type: web
     name: wa-ai-bot
     runtime: node
-    buildCommand: npm install
+    buildCommand: npm install && cd client && npm install && npm run build
     startCommand: node server.js
     plan: free
     envVars:
@@ -18,4 +18,10 @@ services:
         value: "You are a helpful AI assistant responding on WhatsApp. Be concise, friendly, and helpful. Respond in the same language the user writes in."
       - key: NODE_VERSION
         value: "20.11.0"
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: AUTH_GIST_ID
+        sync: false
     healthCheckPath: /health
