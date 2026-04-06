@@ -43,8 +43,13 @@ const TEMP_DIR = path.join(__dirname, 'temp');
 [KNOWLEDGE_DIR, CUSTOMERS_DIR, TEMP_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 
 // --- Auth Backup/Restore via GitHub Gist ---
+let lastBackupTime = 0;
 async function backupAuthToGitHub() {
   if (!GITHUB_TOKEN) return;
+  // Debounce: max once per 30 seconds
+  const now = Date.now();
+  if (now - lastBackupTime < 30000) return;
+  lastBackupTime = now;
   const authDir = path.join(__dirname, 'auth_info');
   if (!fs.existsSync(authDir)) return;
   try {
@@ -529,30 +534,36 @@ async function startWhatsApp() {
         // Clear any pending reconnect
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
-        if (sc === DisconnectReason.loggedOut) {
+        if (sc === 440) {
+          // 440 = Connection replaced by another instance (e.g. Render deploy)
+          // DO NOT reconnect - the new instance will handle it
+          console.log('🛑 Connection replaced by another instance. NOT reconnecting.');
+          connectionStatus = 'disconnected';
+          io.emit('status_change', { status: 'disconnected' });
+          return;
+        } else if (sc === DisconnectReason.loggedOut) {
           // Logged out - need new QR scan
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
           const ap = path.join(__dirname, 'auth_info');
           if (fs.existsSync(ap)) fs.rmSync(ap, { recursive: true, force: true });
           reconnectTimer = setTimeout(startWhatsApp, 5000);
-        } else if (sc === 440 || sc === 515) {
-          // 440 = Connection replaced, 515 = restart required
-          // Wait longer before reconnecting to avoid loop
-          console.log('⏳ Waiting 30s before reconnect (connection replaced)...');
+        } else if (sc === 515) {
+          // 515 = restart required - wait long
+          console.log('⏳ Waiting 60s before reconnect...');
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
-          reconnectTimer = setTimeout(startWhatsApp, 30000);
+          reconnectTimer = setTimeout(startWhatsApp, 60000);
         } else if (sc === 408) {
-          // QR timeout - retry normally
+          // QR timeout
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
           reconnectTimer = setTimeout(startWhatsApp, 5000);
         } else {
-          // Other errors - reconnect with delay
+          // Other errors
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
-          reconnectTimer = setTimeout(startWhatsApp, 10000);
+          reconnectTimer = setTimeout(startWhatsApp, 15000);
         }
       }
 
