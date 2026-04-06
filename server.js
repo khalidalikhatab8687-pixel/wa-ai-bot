@@ -779,4 +779,6 @@ server.listen(PORT, '0.0.0.0', async () => {
   // Restore data (knowledge + customers) from GitHub backup
   await restoreDataFromGitHub();
   startWhatsApp();
+  // Initial data backup after 10 seconds (creates DATA_GIST_ID if needed)
+  setTimeout(() => { lastDataBackupTime = 0; backupDataToGitHub(); }, 10000);
 });
