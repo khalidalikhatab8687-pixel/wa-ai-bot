@@ -500,6 +500,8 @@ async function startWhatsApp() {
 
     whatsappSocket = sock;
 
+    let reconnectTimer = null;
+
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
@@ -518,20 +520,39 @@ async function startWhatsApp() {
         const sc = lastDisconnect?.error?.output?.statusCode;
         console.log(`❌ Connection closed. Status: ${sc}`);
         currentQR = null; whatsappSocket = null;
+
         if (isRestarting) {
           console.log('🔄 Manual restart in progress, skipping auto-reconnect');
           return;
         }
+
+        // Clear any pending reconnect
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
         if (sc === DisconnectReason.loggedOut) {
+          // Logged out - need new QR scan
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
           const ap = path.join(__dirname, 'auth_info');
           if (fs.existsSync(ap)) fs.rmSync(ap, { recursive: true, force: true });
-          setTimeout(startWhatsApp, 5000);
-        } else {
+          reconnectTimer = setTimeout(startWhatsApp, 5000);
+        } else if (sc === 440 || sc === 515) {
+          // 440 = Connection replaced, 515 = restart required
+          // Wait longer before reconnecting to avoid loop
+          console.log('⏳ Waiting 30s before reconnect (connection replaced)...');
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
-          setTimeout(startWhatsApp, 5000);
+          reconnectTimer = setTimeout(startWhatsApp, 30000);
+        } else if (sc === 408) {
+          // QR timeout - retry normally
+          connectionStatus = 'disconnected';
+          io.emit('status_change', { status: 'disconnected' });
+          reconnectTimer = setTimeout(startWhatsApp, 5000);
+        } else {
+          // Other errors - reconnect with delay
+          connectionStatus = 'disconnected';
+          io.emit('status_change', { status: 'disconnected' });
+          reconnectTimer = setTimeout(startWhatsApp, 10000);
         }
       }
 
@@ -540,16 +561,12 @@ async function startWhatsApp() {
         connectionStatus = 'connected';
         currentQR = null;
         io.emit('status_change', { status: 'connected' });
-        // Backup auth after successful connection
-        setTimeout(() => backupAuthToGitHub(), 3000);
+        // Backup auth once after connection
+        setTimeout(() => backupAuthToGitHub(), 5000);
       }
     });
 
-    sock.ev.on('creds.update', async () => {
-      await saveCreds();
-      // Backup after creds update too
-      backupAuthToGitHub();
-    });
+    sock.ev.on('creds.update', saveCreds);
 
     // --- Message Handler ---
     sock.ev.on('messages.upsert', async (m) => {
