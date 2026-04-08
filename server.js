@@ -714,14 +714,16 @@ async function startWhatsApp() {
         const isLid = remoteJid.endsWith('@lid');
         const pushName = msg.pushName || '';
         
-        // Update customer name and jid if available
-        if (pushName || isLid) {
-          const cust = loadCustomer(phone);
-          if (pushName && pushName !== cust.name) { cust.name = pushName; }
-          if (!cust.jid) { cust.jid = remoteJid; }
-          if (isLid) { cust.isLid = true; }
-          saveCustomer(phone, cust);
-        }
+        // Update customer name (safe - won't break message handling)
+        try {
+          if (pushName || isLid) {
+            const cust = loadCustomer(phone);
+            if (pushName) { cust.name = pushName; }
+            if (!cust.jid) { cust.jid = remoteJid; }
+            if (isLid) { cust.isLid = true; }
+            saveCustomer(phone, cust);
+          }
+        } catch (e) { console.error('Customer update error:', e.message); }
         
         let text = '';
 
