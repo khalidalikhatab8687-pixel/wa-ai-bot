@@ -180,6 +180,7 @@ const MAX_LOGS = 500;
 let botEnabled = true;
 let voiceTranscriptionEnabled = true;
 let isRestarting = false;
+let reconnect440Count = 0;
 
 // --- Knowledge Base Helpers ---
 function loadKnowledge(file) {
@@ -663,11 +664,18 @@ async function startWhatsApp() {
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
         if (sc === 440) {
-          // 440 = Connection replaced by another instance (e.g. Render deploy)
-          // DO NOT reconnect - the new instance will handle it
-          console.log('🛑 Connection replaced by another instance. NOT reconnecting.');
+          // 440 = Connection replaced by another instance
+          // Wait then try to reconnect (in case WE are the new instance)
+          reconnect440Count = (reconnect440Count || 0) + 1;
+          const delay = Math.min(reconnect440Count * 15000, 60000); // 15s, 30s, 45s, 60s max
+          console.log(`🔄 Connection replaced (440). Retry #${reconnect440Count} in ${delay/1000}s...`);
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
+          if (reconnect440Count <= 5) {
+            reconnectTimer = setTimeout(startWhatsApp, delay);
+          } else {
+            console.log('🛑 Max 440 retries reached. Stopping.');
+          }
           return;
         } else if (sc === DisconnectReason.loggedOut) {
           // Logged out - need new QR scan
@@ -699,6 +707,7 @@ async function startWhatsApp() {
         console.log('✅ WhatsApp Connected!');
         connectionStatus = 'connected';
         currentQR = null;
+        reconnect440Count = 0; // Reset 440 counter on successful connection
         io.emit('status_change', { status: 'connected' });
         // Backup auth once after connection
         setTimeout(() => backupAuthToGitHub(), 5000);
