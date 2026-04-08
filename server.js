@@ -696,12 +696,12 @@ async function startWhatsApp() {
 
         const remoteJid = msg.key.remoteJid || '';
         
-        // Skip LID (Linked ID) messages - these don't have real phone numbers
-        if (remoteJid.endsWith('@lid') || remoteJid.endsWith('@newsletter')) continue;
+        // Skip newsletters only
+        if (remoteJid.endsWith('@newsletter')) continue;
         
-        // Extract clean phone number
+        // Extract phone/ID for storage (clean format)
         const phone = remoteJid.replace('@s.whatsapp.net', '').replace('@lid', '') || 'unknown';
-        if (phone === 'unknown' || phone.length < 8) continue;
+        if (phone === 'unknown') continue;
         let text = '';
 
         // Handle voice messages
