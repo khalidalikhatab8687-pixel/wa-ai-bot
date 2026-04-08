@@ -671,17 +671,16 @@ async function startWhatsApp() {
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 
         if (sc === 440) {
-          // 440 = Connection replaced by another instance
-          // Wait then try to reconnect (in case WE are the new instance)
-          reconnect440Count = (reconnect440Count || 0) + 1;
-          const delay = Math.min(reconnect440Count * 15000, 60000); // 15s, 30s, 45s, 60s max
+          // 440 = Connection replaced by another instance (during deploy)
+          reconnect440Count++;
+          const delay = Math.min(30000 + (reconnect440Count * 30000), 120000); // 60s, 90s, 120s
           console.log(`🔄 Connection replaced (440). Retry #${reconnect440Count} in ${delay/1000}s...`);
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
-          if (reconnect440Count <= 5) {
+          if (reconnect440Count <= 3) {
             reconnectTimer = setTimeout(startWhatsApp, delay);
           } else {
-            console.log('🛑 Max 440 retries reached. Stopping.');
+            console.log('🛑 Max 440 retries reached. Use dashboard Reconnect button.');
           }
           return;
         } else if (sc === DisconnectReason.loggedOut) {
@@ -714,8 +713,14 @@ async function startWhatsApp() {
         console.log('✅ WhatsApp Connected!');
         connectionStatus = 'connected';
         currentQR = null;
-        reconnect440Count = 0; // Reset 440 counter on successful connection
         io.emit('status_change', { status: 'connected' });
+        // Reset 440 counter after 2 min stable connection (not immediately)
+        setTimeout(() => {
+          if (connectionStatus === 'connected') {
+            reconnect440Count = 0;
+            console.log('✅ Connection stable for 2 min. 440 counter reset.');
+          }
+        }, 120000);
         // Backup auth once after connection
         setTimeout(() => backupAuthToGitHub(), 5000);
       }
