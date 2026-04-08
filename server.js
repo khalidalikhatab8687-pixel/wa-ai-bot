@@ -18,6 +18,10 @@ import makeWASocket, {
   downloadMediaMessage
 } from '@whiskeysockets/baileys';
 
+// Prevent process crash from unhandled errors
+process.on('unhandledRejection', (err) => { console.error('⚠️ Unhandled rejection:', err?.message || err); });
+process.on('uncaughtException', (err) => { console.error('⚠️ Uncaught exception:', err?.message || err); });
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -293,8 +297,6 @@ function addCustomerMessage(phone, role, content) {
   customer.messages.push({ role, content, timestamp: new Date().toISOString() });
   customer.lastContact = new Date().toISOString();
   saveCustomer(phone, customer);
-  // Trigger data backup (debounced)
-  backupDataToGitHub();
   return customer;
 }
 
@@ -799,6 +801,10 @@ io.on('connection', (socket) => {
 });
 
 // --- Start ---
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', async () => {
   console.log(`\n🌐 Server running on http://localhost:${PORT}`);
@@ -806,9 +812,12 @@ server.listen(PORT, '0.0.0.0', async () => {
   console.log(`🤖 AI Model: ${process.env.OPENROUTER_MODEL}`);
   console.log(`🎤 Voice Transcription: ${process.env.GROQ_API_KEY ? 'Enabled' : 'Disabled'}`);
   console.log('');
-  // Restore data (knowledge + customers) from GitHub backup
-  await restoreDataFromGitHub();
+  // Restore data with timeout (max 15 seconds) - don't let it hang
+  try {
+    await Promise.race([
+      restoreDataFromGitHub(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000))
+    ]);
+  } catch (e) { console.log('⚠️ Data restore skipped:', e.message); }
   startWhatsApp();
-  // Initial data backup after 10 seconds (creates DATA_GIST_ID if needed)
-  setTimeout(() => { lastDataBackupTime = 0; backupDataToGitHub(); }, 10000);
 });
