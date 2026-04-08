@@ -694,7 +694,14 @@ async function startWhatsApp() {
         if (msg.key.remoteJid?.endsWith('@g.us')) continue;
         if (msg.key.fromMe) continue;
 
-        const phone = msg.key.remoteJid?.replace('@s.whatsapp.net', '') || 'unknown';
+        const remoteJid = msg.key.remoteJid || '';
+        
+        // Skip LID (Linked ID) messages - these don't have real phone numbers
+        if (remoteJid.endsWith('@lid') || remoteJid.endsWith('@newsletter')) continue;
+        
+        // Extract clean phone number
+        const phone = remoteJid.replace('@s.whatsapp.net', '').replace('@lid', '') || 'unknown';
+        if (phone === 'unknown' || phone.length < 8) continue;
         let text = '';
 
         // Handle voice messages
