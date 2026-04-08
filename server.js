@@ -182,6 +182,9 @@ let voiceTranscriptionEnabled = true;
 let isRestarting = false;
 let reconnect440Count = 0;
 
+// LID to Phone mapping cache
+const lidPhoneMap = new Map();
+
 // --- Knowledge Base Helpers ---
 function loadKnowledge(file) {
   const p = path.join(KNOWLEDGE_DIR, `${file}.json`);
@@ -562,13 +565,17 @@ async function handleTransfer(aiResponse, customerPhone, sock) {
   // Build transfer message with customer name
   const customerName = customer.name || 'غير معروف';
   const isLidCustomer = customer.isLid || false;
+  // Try to get real phone: 1) resolved from LID mapping, 2) from chat, 3) from cache
+  const resolvedPhone = customer.realPhone || lidPhoneMap.get(customerPhone) || extractedPhone;
+  
   let customerInfo = '';
   if (isLidCustomer) {
     customerInfo = `👤 *اسم العميل:* ${customerName}`;
-    if (extractedPhone) {
-      customerInfo += `\n📱 *رقم التليفون:* ${extractedPhone}`;
+    if (resolvedPhone) {
+      customerInfo += `\n📱 *رقم التليفون:* ${resolvedPhone}`;
+    } else {
+      customerInfo += `\n⚠️ *الرقم:* غير متاح حالياً (WhatsApp LID)`;
     }
-    customerInfo += `\n🆔 *معرف واتساب:* ${customerPhone}\n💡 *ملاحظة:* العميل ده بيستخدم WhatsApp LID - لو مفيش رقم تليفون، ارجع للمحادثة في الواتساب مباشرة`;
   } else {
     customerInfo = `👤 *اسم العميل:* ${customerName}\n📱 *رقم العميل:* ${customerPhone}`;
   }
@@ -737,15 +744,28 @@ async function startWhatsApp() {
         const isLid = remoteJid.endsWith('@lid');
         const pushName = msg.pushName || '';
         
-        // Update customer name (safe - won't break message handling)
+        // Update customer name and resolve LID to phone (safe)
         try {
-          if (pushName || isLid) {
-            const cust = loadCustomer(phone);
-            if (pushName) { cust.name = pushName; }
-            if (!cust.jid) { cust.jid = remoteJid; }
-            if (isLid) { cust.isLid = true; }
-            saveCustomer(phone, cust);
+          const cust = loadCustomer(phone);
+          if (pushName) { cust.name = pushName; }
+          if (!cust.jid) { cust.jid = remoteJid; }
+          if (isLid) { cust.isLid = true; }
+          
+          // Layer 1: Check senderPn (phone number from WhatsApp metadata)
+          const senderPn = msg.key.senderPn || msg.key.remoteJidAlt;
+          if (senderPn && isLid) {
+            const realPhone = senderPn.replace('@s.whatsapp.net', '');
+            cust.realPhone = realPhone;
+            lidPhoneMap.set(phone, realPhone);
+            console.log(`📱 LID resolved: ${phone} → ${realPhone}`);
           }
+          
+          // Layer 2: Check cached mapping
+          if (!cust.realPhone && lidPhoneMap.has(phone)) {
+            cust.realPhone = lidPhoneMap.get(phone);
+          }
+          
+          saveCustomer(phone, cust);
         } catch (e) { console.error('Customer update error:', e.message); }
         
         let text = '';
@@ -794,7 +814,24 @@ async function startWhatsApp() {
           aiResponse = await handleTransfer(aiResponse, phone, sock);
 
           await sock.sendPresenceUpdate('paused', msg.key.remoteJid);
-          await sock.sendMessage(msg.key.remoteJid, { text: aiResponse });
+          const sentMsg = await sock.sendMessage(msg.key.remoteJid, { text: aiResponse });
+          
+          // Layer 3: Extract phone from sendMessage response
+          try {
+            if (isLid && sentMsg?.key) {
+              const altJid = sentMsg.key.remoteJidAlt || sentMsg.key.senderPn;
+              if (altJid) {
+                const realPhone = altJid.replace('@s.whatsapp.net', '');
+                const cust = loadCustomer(phone);
+                if (!cust.realPhone) {
+                  cust.realPhone = realPhone;
+                  lidPhoneMap.set(phone, realPhone);
+                  saveCustomer(phone, cust);
+                  console.log(`📱 LID resolved from reply: ${phone} → ${realPhone}`);
+                }
+              }
+            }
+          } catch (e) { /* ignore */ }
 
           addLog('auto_reply', phone, text, aiResponse);
           console.log(`🤖 Replied to ${phone}: ${aiResponse.substring(0, 80)}...`);
