@@ -279,7 +279,7 @@ function getCustomerPath(phone) {
 function loadCustomer(phone) {
   const p = getCustomerPath(phone);
   if (!fs.existsSync(p)) {
-    return { phone, firstContact: new Date().toISOString(), messages: [] };
+    return { phone, name: '', jid: '', firstContact: new Date().toISOString(), messages: [] };
   }
   return JSON.parse(fs.readFileSync(p, 'utf8'));
 }
@@ -548,9 +548,18 @@ async function handleTransfer(aiResponse, customerPhone, sock) {
   const customer = loadCustomer(customerPhone);
   const lastMessages = customer.messages.slice(-10).map(m => `${m.role === 'user' ? '👤 العميل' : '🤖 البوت'}: ${m.content}`).join('\n');
 
-  // Build transfer message to responsible person
+  // Build transfer message with customer name
+  const customerName = customer.name || 'غير معروف';
+  const isLidCustomer = customer.isLid || false;
+  let customerInfo = '';
+  if (isLidCustomer) {
+    customerInfo = `👤 *اسم العميل:* ${customerName}\n📱 *معرف العميل:* ${customerPhone}\n💡 *ملاحظة:* العميل ده بيستخدم WhatsApp LID - ارجع للمحادثة في الواتساب مباشرة للرد عليه`;
+  } else {
+    customerInfo = `👤 *اسم العميل:* ${customerName}\n📱 *رقم العميل:* ${customerPhone}`;
+  }
+  
   const transferMsg = `📋 *طلب تحويل جديد*\n\n` +
-    `👤 *رقم العميل:* ${customerPhone}\n` +
+    `${customerInfo}\n` +
     `🏢 *القسم:* ${dept.name}\n` +
     `📅 *الوقت:* ${new Date().toLocaleString('ar-EG')}\n\n` +
     `💬 *آخر المحادثات:*\n${lastMessages}`;
@@ -702,6 +711,18 @@ async function startWhatsApp() {
         // Extract phone/ID for storage (clean format)
         const phone = remoteJid.replace('@s.whatsapp.net', '').replace('@lid', '') || 'unknown';
         if (phone === 'unknown') continue;
+        const isLid = remoteJid.endsWith('@lid');
+        const pushName = msg.pushName || '';
+        
+        // Update customer name and jid if available
+        if (pushName || isLid) {
+          const cust = loadCustomer(phone);
+          if (pushName && pushName !== cust.name) { cust.name = pushName; }
+          if (!cust.jid) { cust.jid = remoteJid; }
+          if (isLid) { cust.isLid = true; }
+          saveCustomer(phone, cust);
+        }
+        
         let text = '';
 
         // Handle voice messages
