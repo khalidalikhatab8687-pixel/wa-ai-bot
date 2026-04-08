@@ -550,12 +550,21 @@ async function handleTransfer(aiResponse, customerPhone, sock) {
   const customer = loadCustomer(customerPhone);
   const lastMessages = customer.messages.slice(-10).map(m => `${m.role === 'user' ? '👤 العميل' : '🤖 البوت'}: ${m.content}`).join('\n');
 
+  // Try to find phone number from conversation (customer might have shared it)
+  const allUserMessages = customer.messages.filter(m => m.role === 'user').map(m => m.content).join(' ');
+  const phoneMatch = allUserMessages.match(/(?:01|002|201|\+201)\d{9,10}/);
+  const extractedPhone = phoneMatch ? phoneMatch[0] : '';
+
   // Build transfer message with customer name
   const customerName = customer.name || 'غير معروف';
   const isLidCustomer = customer.isLid || false;
   let customerInfo = '';
   if (isLidCustomer) {
-    customerInfo = `👤 *اسم العميل:* ${customerName}\n📱 *معرف العميل:* ${customerPhone}\n💡 *ملاحظة:* العميل ده بيستخدم WhatsApp LID - ارجع للمحادثة في الواتساب مباشرة للرد عليه`;
+    customerInfo = `👤 *اسم العميل:* ${customerName}`;
+    if (extractedPhone) {
+      customerInfo += `\n📱 *رقم التليفون:* ${extractedPhone}`;
+    }
+    customerInfo += `\n🆔 *معرف واتساب:* ${customerPhone}\n💡 *ملاحظة:* العميل ده بيستخدم WhatsApp LID - لو مفيش رقم تليفون، ارجع للمحادثة في الواتساب مباشرة`;
   } else {
     customerInfo = `👤 *اسم العميل:* ${customerName}\n📱 *رقم العميل:* ${customerPhone}`;
   }
