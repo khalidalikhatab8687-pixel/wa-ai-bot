@@ -701,30 +701,41 @@ async function startWhatsApp() {
         if (sc === 440) {
           // 440 = Connection replaced by another instance (during deploy)
           reconnect440Count++;
-          const delay = Math.min(30000 + (reconnect440Count * 30000), 120000); // 60s, 90s, 120s
+          isConnecting = false;
+          const delay = Math.min(30000 + (reconnect440Count * 30000), 120000);
           console.log(`🔄 Connection replaced (440). Retry #${reconnect440Count} in ${delay/1000}s...`);
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
           if (reconnect440Count <= 3) {
-            reconnectTimer = setTimeout(startWhatsApp, delay);
+            reconnectTimer = setTimeout(() => { isConnecting = false; startWhatsApp(); }, delay);
           } else {
             console.log('🛑 Max 440 retries reached. Use dashboard Reconnect button.');
           }
           return;
         } else if (sc === DisconnectReason.loggedOut || sc === 401) {
-          // Logged out - need new QR scan
-          console.log('🔑 Session expired! Clearing auth and generating new QR...');
+          // Logged out - FULL STOP. Clear everything.
+          console.log('🔑 Session expired! Stopping all connections...');
           sessionExpired = true;
           isConnecting = false;
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
-          // Delete local auth
+          // Kill ALL pending reconnect timers
+          if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+          // Delete local auth completely
           const ap = path.join(__dirname, 'auth_info');
-          if (fs.existsSync(ap)) fs.rmSync(ap, { recursive: true, force: true });
-          // Clear GitHub backup so stale auth doesn't get restored
-          await clearAuthFromGitHub();
-          // Wait for clear to finish, then reconnect for QR
-          reconnectTimer = setTimeout(() => { isConnecting = false; startWhatsApp(); }, 10000);
+          try { if (fs.existsSync(ap)) fs.rmSync(ap, { recursive: true, force: true }); } catch(e) {}
+          // Clear GitHub backup
+          try { await clearAuthFromGitHub(); } catch(e) {}
+          // Wait 15s then ONE clean restart for QR
+          console.log('⏳ Waiting 15s before generating new QR...');
+          reconnectTimer = setTimeout(() => {
+            isConnecting = false;
+            sessionExpired = false; // Allow fresh start
+            // Double-check auth is deleted
+            try { if (fs.existsSync(ap)) fs.rmSync(ap, { recursive: true, force: true }); } catch(e) {}
+            startWhatsApp();
+          }, 15000);
+          return; // IMPORTANT: return immediately, don't fall through
         } else if (sc === 515) {
           // 515 = restart required - wait long
           console.log('⏳ Waiting 60s before reconnect...');
