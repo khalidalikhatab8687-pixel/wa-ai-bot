@@ -724,15 +724,18 @@ async function startWhatsApp() {
           // Delete local auth completely
           const ap = path.join(__dirname, 'auth_info');
           try { if (fs.existsSync(ap)) fs.rmSync(ap, { recursive: true, force: true }); } catch(e) {}
-          // Clear GitHub backup
-          try { await clearAuthFromGitHub(); } catch(e) {}
+          // Invalidate the gist ID so restore can NEVER fetch stale auth
+          const savedGistId = authGistId;
+          authGistId = '';
+          console.log('🗑️ Auth invalidated. Waiting 15s for new QR...');
           // Wait 15s then ONE clean restart for QR
-          console.log('⏳ Waiting 15s before generating new QR...');
           reconnectTimer = setTimeout(() => {
             isConnecting = false;
-            sessionExpired = false; // Allow fresh start
-            // Double-check auth is deleted
+            // Keep sessionExpired = true! Only reset on successful 'open'
+            // Delete auth again just to be sure
             try { if (fs.existsSync(ap)) fs.rmSync(ap, { recursive: true, force: true }); } catch(e) {}
+            // Restore gist ID so new auth can be backed up after QR scan
+            authGistId = savedGistId;
             startWhatsApp();
           }, 15000);
           return; // IMPORTANT: return immediately, don't fall through
