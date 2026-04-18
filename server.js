@@ -96,6 +96,26 @@ async function restoreAuthFromGitHub() {
   } catch (err) { console.error('Auth restore error:', err.message); return false; }
 }
 
+async function clearAuthFromGitHub() {
+  if (!GITHUB_TOKEN || !authGistId) return;
+  try {
+    // Get current gist files and set them to empty to "delete" them
+    const res = await fetch(`https://api.github.com/gists/${authGistId}`, { headers: { Authorization: `token ${GITHUB_TOKEN}` } });
+    const data = await res.json();
+    if (!data.files) return;
+    const files = {};
+    for (const name of Object.keys(data.files)) {
+      files[name] = null; // null deletes the file from gist
+    }
+    await fetch(`https://api.github.com/gists/${authGistId}`, {
+      method: 'PATCH',
+      headers: { Authorization: `token ${GITHUB_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ files })
+    });
+    console.log('☁️ Auth cleared from GitHub (session expired)');
+  } catch (err) { console.error('Auth clear error:', err.message); }
+}
+
 // --- Data Backup/Restore (Knowledge + Customers) ---
 let dataGistId = process.env.DATA_GIST_ID || '';
 let lastDataBackupTime = 0;
@@ -683,12 +703,16 @@ async function startWhatsApp() {
             console.log('🛑 Max 440 retries reached. Use dashboard Reconnect button.');
           }
           return;
-        } else if (sc === DisconnectReason.loggedOut) {
+        } else if (sc === DisconnectReason.loggedOut || sc === 401) {
           // Logged out - need new QR scan
+          console.log('🔑 Session expired! Clearing auth and generating new QR...');
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
+          // Delete local auth
           const ap = path.join(__dirname, 'auth_info');
           if (fs.existsSync(ap)) fs.rmSync(ap, { recursive: true, force: true });
+          // Clear GitHub backup so stale auth doesn't get restored
+          await clearAuthFromGitHub();
           reconnectTimer = setTimeout(startWhatsApp, 5000);
         } else if (sc === 515) {
           // 515 = restart required - wait long
