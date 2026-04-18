@@ -81,15 +81,18 @@ async function backupAuthToGitHub() {
 
 async function restoreAuthFromGitHub() {
   if (!GITHUB_TOKEN || !authGistId) return false;
+  if (sessionExpired) { console.log('⏭️ Skipping auth restore (session expired)'); return false; }
   const authDir = path.join(__dirname, 'auth_info');
   if (fs.existsSync(authDir) && fs.readdirSync(authDir).length > 0) return true; // already exists
   try {
     const res = await fetch(`https://api.github.com/gists/${authGistId}`, { headers: { Authorization: `token ${GITHUB_TOKEN}` } });
     const data = await res.json();
-    if (!data.files) return false;
+    if (!data.files || Object.keys(data.files).length === 0) return false;
     if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
     for (const [name, file] of Object.entries(data.files)) {
-      fs.writeFileSync(path.join(authDir, name), file.content, 'utf8');
+      if (file && file.content) {
+        fs.writeFileSync(path.join(authDir, name), file.content, 'utf8');
+      }
     }
     console.log('☁️ Auth restored from GitHub! No QR needed.');
     return true;
@@ -201,6 +204,8 @@ let botEnabled = true;
 let voiceTranscriptionEnabled = true;
 let isRestarting = false;
 let reconnect440Count = 0;
+let sessionExpired = false;
+let isConnecting = false;
 
 // LID to Phone mapping cache
 const lidPhoneMap = new Map();
@@ -630,6 +635,9 @@ async function handleTransfer(aiResponse, customerPhone, sock) {
 
 // --- WhatsApp ---
 async function startWhatsApp() {
+  // Prevent concurrent connections
+  if (isConnecting) { console.log('⏳ Already connecting, skipping...'); return; }
+  isConnecting = true;
   console.log('🚀 Starting WhatsApp connection...');
   connectionStatus = 'connecting';
   io.emit('status_change', { status: connectionStatus });
@@ -706,6 +714,8 @@ async function startWhatsApp() {
         } else if (sc === DisconnectReason.loggedOut || sc === 401) {
           // Logged out - need new QR scan
           console.log('🔑 Session expired! Clearing auth and generating new QR...');
+          sessionExpired = true;
+          isConnecting = false;
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
           // Delete local auth
@@ -713,7 +723,8 @@ async function startWhatsApp() {
           if (fs.existsSync(ap)) fs.rmSync(ap, { recursive: true, force: true });
           // Clear GitHub backup so stale auth doesn't get restored
           await clearAuthFromGitHub();
-          reconnectTimer = setTimeout(startWhatsApp, 5000);
+          // Wait for clear to finish, then reconnect for QR
+          reconnectTimer = setTimeout(() => { isConnecting = false; startWhatsApp(); }, 10000);
         } else if (sc === 515) {
           // 515 = restart required - wait long
           console.log('⏳ Waiting 60s before reconnect...');
@@ -737,6 +748,8 @@ async function startWhatsApp() {
         console.log('✅ WhatsApp Connected!');
         connectionStatus = 'connected';
         currentQR = null;
+        sessionExpired = false; // Reset expired flag
+        isConnecting = false;
         io.emit('status_change', { status: 'connected' });
         // Reset 440 counter after 2 min stable connection (not immediately)
         setTimeout(() => {
@@ -874,8 +887,9 @@ async function startWhatsApp() {
   } catch (err) {
     console.error('❌ WhatsApp error:', err.message);
     connectionStatus = 'disconnected';
+    isConnecting = false;
     io.emit('status_change', { status: 'disconnected' });
-    setTimeout(startWhatsApp, 10000);
+    setTimeout(() => { isConnecting = false; startWhatsApp(); }, 10000);
   }
 }
 
