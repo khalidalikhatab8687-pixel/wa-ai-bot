@@ -740,21 +740,24 @@ async function startWhatsApp() {
           }, 15000);
           return; // IMPORTANT: return immediately, don't fall through
         } else if (sc === 515) {
-          // 515 = restart required - wait long
+          // 515 = restart required
           console.log('⏳ Waiting 60s before reconnect...');
+          isConnecting = false;
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
-          reconnectTimer = setTimeout(startWhatsApp, 60000);
+          reconnectTimer = setTimeout(() => { isConnecting = false; startWhatsApp(); }, 60000);
         } else if (sc === 408) {
-          // QR timeout
+          // QR timeout - generate new one quickly
+          isConnecting = false;
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
-          reconnectTimer = setTimeout(startWhatsApp, 5000);
+          reconnectTimer = setTimeout(() => { isConnecting = false; startWhatsApp(); }, 5000);
         } else {
           // Other errors
+          isConnecting = false;
           connectionStatus = 'disconnected';
           io.emit('status_change', { status: 'disconnected' });
-          reconnectTimer = setTimeout(startWhatsApp, 15000);
+          reconnectTimer = setTimeout(() => { isConnecting = false; startWhatsApp(); }, 15000);
         }
       }
 
